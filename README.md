@@ -151,8 +151,11 @@ Authentication: `Authorization: Bearer <TRANSLATE_API_KEY>`.
 ├── service/
 │   ├── pdf_translate_v3_service.py — the service itself (~2700 lines)
 │   └── requirements.txt            — Python dependencies
-└── scripts/
-    └── skycare-pdf-translate-v3.service  — systemd unit
+├── scripts/
+│   └── skycare-pdf-translate-v3.service  — systemd unit
+└── docs/
+    ├── history.md                  — why the service looks the way it does
+    └── filemaker-integration.md    — calling the service from Presida
 ```
 
 ## Deployment
@@ -216,21 +219,18 @@ failures on this box, now encoded in `scripts/skycare-pdf-translate-v3.service`:
 
 ## History
 
-The service has gone through several substantial redesigns as failure modes
-surfaced. The commit log is the authoritative record; a brief timeline of
-the larger shifts:
+Several substantial redesigns in response to specific real failures.
+[`docs/history.md`](docs/history.md) has the full account of each pivot
+and the reasoning — worth reading before changing any of the safety
+guards, because most of them exist to prevent a specific class of silent
+failure that cost real debugging time to find.
 
-- **v1** (single-model, in-place block replacement) — lost lists, dropped
-  blocks, destroyed watermark bboxes. Retired.
-- **v2** (two-stage adaptive Mistral/Llama) — added language escalation.
-- **v3** (async job queue) — current. Added SQLite job store, FileMaker-
-  friendly submit/poll/fetch endpoints, truncation guards.
-- **Simplified Mode A** (Sept 2026) — abandoned block-by-block whiteout in
-  favour of text-layer extraction → clean English PDF → original appendix.
-  Deleted ~370 lines.
-- **Fast-fail scan handling + Cyrillic Tesseract + error PDF** (Nov 2026).
-- **Adaptive OpenCV preprocessing** (Nov 2026) — per-page, measured, kept
-  only when it improves yield.
+## FileMaker integration
+
+The service is called from Presida with a submit/poll/fetch loop.
+[`docs/filemaker-integration.md`](docs/filemaker-integration.md) has the
+script pattern, form fields, the cURL container-variable quirk, and the
+`jobID` / `job_id` dual-field convention.
 
 ## Related services
 
