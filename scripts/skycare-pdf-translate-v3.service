@@ -1,0 +1,37 @@
+[Unit]
+Description=SkyCare PDF Translation Service v3 — Async Queue (OVHcloud/Mistral+Llama)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/skycare/pdf-translate-v3
+
+EnvironmentFile=/opt/skycare/pdf-translate-v3/.env
+
+# 2 workers — matches MAX_WORKERS in the service.
+# 240s timeout — background jobs run independently but Gunicorn still needs
+# to handle the result fetch request while a long job occupies the other worker.
+ExecStart=/opt/skycare/pdf-translate-v3/venv/bin/gunicorn \
+    --workers 2 \
+    --timeout 240 \
+    --bind 0.0.0.0:${TRANSLATE_PORT} \
+    --access-logfile /var/log/skycare/pdf-translate-v3-access.log \
+    --error-logfile  /var/log/skycare/pdf-translate-v3-error.log \
+    pdf_translate_v3_service:app
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skycare-pdf-translate-v3
+
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ReadWritePaths=/var/log/skycare /tmp/skycare-jobs /tmp
+
+[Install]
+WantedBy=multi-user.target

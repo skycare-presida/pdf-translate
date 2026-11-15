@@ -142,6 +142,19 @@ Form fields accepted by `/submit`:
 
 Authentication: `Authorization: Bearer <TRANSLATE_API_KEY>`.
 
+## Repository layout
+
+```
+├── README.md                       — this file
+├── install.sh                      — idempotent installer (run as root on Ancilla)
+├── .env.example                    — template for the two API keys
+├── service/
+│   ├── pdf_translate_v3_service.py — the service itself (~2700 lines)
+│   └── requirements.txt            — Python dependencies
+└── scripts/
+    └── skycare-pdf-translate-v3.service  — systemd unit
+```
+
 ## Deployment
 
 Installed at `/opt/skycare/pdf-translate-v3/` on Ancilla (Ubuntu 24.04),
@@ -149,39 +162,49 @@ running as `www-data` under systemd as `skycare-pdf-translate-v3`, listening
 on port 5107. Fronted by nginx with a UFW rule limiting source to the
 Presida server's IP.
 
-### System dependencies
+### Fresh install
+
+Clone and run the installer as root:
 
 ```bash
-sudo apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-ukr tesseract-ocr-rus tesseract-ocr-bul \
-    tesseract-ocr-srp tesseract-ocr-mkd tesseract-ocr-bel tesseract-ocr-kaz
+git clone https://github.com/skycare-presida/pdf-translate.git
+cd pdf-translate
+sudo ./install.sh
 ```
 
-### Python dependencies
+The installer is idempotent and safe to re-run. It:
 
-Into the service's venv:
+- apt-installs Tesseract and the Cyrillic language packs
+- checks port 5107 is free (prompts for an alternative if not)
+- reuses the v1 or v2 venv by symlink if present (saves ~400 MB and ~2 min)
+- inherits API keys from an existing `/opt/skycare/pdf-translate*/env` file
+  if it exists, otherwise prompts for the OVHcloud key and generates a new
+  inbound `TRANSLATE_API_KEY`
+- creates `/opt/skycare/pdf-translate-v3/`, `/var/log/skycare/`, and
+  `/tmp/skycare-jobs/` with the right ownership and modes
+- deploys the service file, `.env` (mode 600), systemd unit, and starts it
+- adds a UFW rule limiting port 5107 to the Presida IP
+- verifies the OpenCV / numpy / pytesseract imports actually succeed —
+  these degrade silently if missing, which bit us in Nov 2026 when
+  preprocessing was packaged but the venv had no cv2
+- runs a health check and prints FileMaker-ready curl examples with the
+  real API key
+
+### Updating the service file only
+
+The common case during iteration — swap the Python file, keep everything
+else untouched. Deployment on Ancilla:
 
 ```bash
-pip install \
-    flask gunicorn openai \
-    pymupdf pdfplumber reportlab pillow \
-    opencv-python-headless numpy pytesseract
+sudo cp service/pdf_translate_v3_service.py /opt/skycare/pdf-translate-v3/
+sudo chown www-data:www-data /opt/skycare/pdf-translate-v3/pdf_translate_v3_service.py
+sudo systemctl restart skycare-pdf-translate-v3
 ```
-
-`opencv-python-headless` is important — the non-headless build pulls GUI
-dependencies that don't belong on a server.
-
-### Configuration
-
-Copy `.env.example` to `.env` alongside the service file and populate both
-keys. The service reads them at startup, so rotating a key requires
-`systemctl restart skycare-pdf-translate-v3`.
 
 ### Ancilla systemd gotchas
 
 These are the specific configuration points that have caused silent
-failures on this box:
+failures on this box, now encoded in `scripts/skycare-pdf-translate-v3.service`:
 
 - **www-data home is `/var/www` and unwritable** — Gunicorn needs
   `--worker-tmp-dir /tmp/skycare-jobs` or it exits 255.

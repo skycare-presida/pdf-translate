@@ -1,0 +1,17 @@
+flask>=3.0
+gunicorn>=22.0
+openai>=1.30
+pymupdf>=1.24
+pdfplumber>=0.11
+reportlab>=4.0
+pillow>=10.0
+
+# OCR preprocessing and Cyrillic fallback (Nov 2026).
+# opencv-python-headless (not opencv-python) — the headless build omits GUI
+# dependencies that don't belong on a server. pytesseract calls the system
+# `tesseract` binary (installed by install.sh); numpy comes in anyway as an
+# OpenCV dependency but is pinned explicitly so a mismatched ABI (cv2 built
+# against a different numpy major version) doesn't silently break imports.
+opencv-python-headless>=4.9
+numpy>=1.26,<3
+pytesseract>=0.3.10
