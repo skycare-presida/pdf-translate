@@ -67,7 +67,23 @@ step "1/8  Port availability check"
 CHECK_PORTS="${V1_INSTALL_DIR}/check_ports.sh"
 [[ -x "$CHECK_PORTS" ]] && bash "$CHECK_PORTS" || true
 
-if ss -tlnp | grep -q ":${DEFAULT_PORT} "; then
+# A re-run (an update) finds the port held by this very service — that is not
+# a conflict. Reuse the port the existing install is configured for.
+EXISTING_INSTALL=false
+EXISTING_PORT=""
+if [[ -f "$SYSTEMD_UNIT" && -f "${INSTALL_DIR}/.env" ]]; then
+    EXISTING_INSTALL=true
+    EXISTING_PORT=$(grep "^TRANSLATE_PORT=" "${INSTALL_DIR}/.env" | cut -d= -f2- || true)
+    EXISTING_PORT="${EXISTING_PORT:-$DEFAULT_PORT}"
+fi
+
+if $EXISTING_INSTALL && systemctl is-active --quiet "${SERVICE_NAME}"; then
+    PORT=$EXISTING_PORT
+    success "Port ${PORT} is held by the running ${SERVICE_NAME} — updating in place."
+elif $EXISTING_INSTALL && ! ss -tlnp | grep -q ":${EXISTING_PORT} "; then
+    PORT=$EXISTING_PORT
+    success "Existing install found (service stopped) — keeping port ${PORT}."
+elif ss -tlnp | grep -q ":${DEFAULT_PORT} "; then
     warn "Port ${DEFAULT_PORT} is already in use."
     read -rp "        Enter an alternative port (or press Enter to abort): " PORT
     [[ -z "$PORT" ]] && error "Aborted by user."
@@ -155,12 +171,20 @@ step "5/8  Deploying service files"
 cp "${SCRIPT_DIR}/service/pdf_translate_v3_service.py" "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}/service/requirements.txt"            "${INSTALL_DIR}/"
 
+# Settings in an existing .env that this installer does not manage (e.g.
+# TRANSLATE_ENGINE, a bind address) must survive an update.
+EXTRA_ENV=""
+if [[ -f "${INSTALL_DIR}/.env" ]]; then
+    EXTRA_ENV=$(grep -vE "^(OVHCLOUD_API_KEY|TRANSLATE_API_KEY|TRANSLATE_PORT|DEEPL_AUTH_KEY)=" "${INSTALL_DIR}/.env" || true)
+fi
+
 cat > "${INSTALL_DIR}/.env" <<EOF
 OVHCLOUD_API_KEY=${OVHCLOUD_KEY}
 TRANSLATE_API_KEY=${SERVICE_KEY}
 TRANSLATE_PORT=${PORT}
 DEEPL_AUTH_KEY=${DEEPL_KEY}
 EOF
+[[ -n "$EXTRA_ENV" ]] && printf '%s\n' "$EXTRA_ENV" >> "${INSTALL_DIR}/.env"
 chmod 600 "${INSTALL_DIR}/.env"
 chown -R www-data:www-data "$INSTALL_DIR"
 success "Files deployed."
@@ -212,7 +236,9 @@ fi
 # ── Step 7: Firewall ──────────────────────────────────────────────────────────
 step "7/8  Firewall"
 
-if command -v ufw &>/dev/null; then
+if $EXISTING_INSTALL; then
+    info "Existing install — firewall rules left as they are."
+elif command -v ufw &>/dev/null; then
     if ufw status | grep -q "${PORT}.*${PRESIDA_IP}"; then
         info "UFW rule for port ${PORT} already exists."
     else
@@ -227,7 +253,15 @@ fi
 # ── Step 8: Systemd ───────────────────────────────────────────────────────────
 step "8/8  Systemd service"
 
-cp "${SCRIPT_DIR}/scripts/skycare-pdf-translate-v3.service" "$SYSTEMD_UNIT"
+# Never overwrite a unit that has been edited on this box (e.g. to bind the
+# WireGuard address instead of 0.0.0.0) — keep it and say so.
+REPO_UNIT="${SCRIPT_DIR}/scripts/skycare-pdf-translate-v3.service"
+if [[ -f "$SYSTEMD_UNIT" ]] && ! cmp -s "$REPO_UNIT" "$SYSTEMD_UNIT"; then
+    warn "Installed systemd unit differs from the repo copy — keeping the installed one."
+    warn "Compare with: diff ${REPO_UNIT} ${SYSTEMD_UNIT}"
+else
+    cp "$REPO_UNIT" "$SYSTEMD_UNIT"
+fi
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
