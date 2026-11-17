@@ -105,10 +105,12 @@ step "3/8  API keys"
 
 OVHCLOUD_KEY=""
 SERVICE_KEY=""
+DEEPL_KEY=""
 
-# Try to inherit from v2 then v1
-for ENV_FILE in "${V2_INSTALL_DIR}/.env" "${V1_INSTALL_DIR}/.env"; do
+# Try to inherit from this install's own .env (a re-run), then v2, then v1
+for ENV_FILE in "${INSTALL_DIR}/.env" "${V2_INSTALL_DIR}/.env" "${V1_INSTALL_DIR}/.env"; do
     if [[ -f "$ENV_FILE" ]]; then
+        [[ -z "$DEEPL_KEY"    ]] && DEEPL_KEY=$(grep "^DEEPL_AUTH_KEY=" "$ENV_FILE" | cut -d= -f2- || true)
         [[ -z "$OVHCLOUD_KEY" ]] && OVHCLOUD_KEY=$(grep "^OVHCLOUD_API_KEY=" "$ENV_FILE" | cut -d= -f2- || true)
         [[ -z "$SERVICE_KEY"  ]] && SERVICE_KEY=$(grep "^TRANSLATE_API_KEY=" "$ENV_FILE" | cut -d= -f2- || true)
     fi
@@ -119,6 +121,15 @@ if [[ -n "$OVHCLOUD_KEY" ]]; then
 else
     read -rsp "        OVHcloud API key (input hidden): " OVHCLOUD_KEY; echo ""
     [[ -z "$OVHCLOUD_KEY" ]] && warn "No key entered — add it later to ${INSTALL_DIR}/.env"
+fi
+
+# DeepL is the primary translation engine; the OVHcloud models above still do
+# OCR and QA, and take over translation whenever DeepL is unavailable.
+if [[ -n "$DEEPL_KEY" ]]; then
+    info "DeepL API key inherited from existing installation."
+else
+    read -rsp "        DeepL API key (input hidden; Enter to skip): " DEEPL_KEY; echo ""
+    [[ -z "$DEEPL_KEY" ]] && warn "No DeepL key — translation will use the OVHcloud models. Add DEEPL_AUTH_KEY to ${INSTALL_DIR}/.env later."
 fi
 
 if [[ -n "$SERVICE_KEY" ]]; then
@@ -148,6 +159,7 @@ cat > "${INSTALL_DIR}/.env" <<EOF
 OVHCLOUD_API_KEY=${OVHCLOUD_KEY}
 TRANSLATE_API_KEY=${SERVICE_KEY}
 TRANSLATE_PORT=${PORT}
+DEEPL_AUTH_KEY=${DEEPL_KEY}
 EOF
 chmod 600 "${INSTALL_DIR}/.env"
 chown -R www-data:www-data "$INSTALL_DIR"
@@ -159,6 +171,13 @@ step "6/8  Python virtual environment"
 if [[ "$SHARE_VENV" == "true" ]]; then
     ln -sfn "$VENV_SOURCE" "${INSTALL_DIR}/venv"
     success "Symlinked ${VENV_SOURCE} → ${INSTALL_DIR}/venv"
+    # A shared venv predates newer dependencies (e.g. deepl) — top it up.
+    if sudo -u www-data "${INSTALL_DIR}/venv/bin/pip" install --quiet \
+        -r "${INSTALL_DIR}/requirements.txt"; then
+        success "Shared venv dependencies are up to date."
+    else
+        warn "Could not update the shared venv — run: ${INSTALL_DIR}/venv/bin/pip install -r ${INSTALL_DIR}/requirements.txt"
+    fi
 else
     if ! python3 -m venv --help &>/dev/null; then
         apt-get install -y python3-venv python3-pip
@@ -182,6 +201,12 @@ else
     warn "OpenCV / numpy / pytesseract did not import — OCR preprocessing"
     warn "and the Cyrillic fallback will be disabled. Service still runs."
     warn "Debug with: ${INSTALL_DIR}/venv/bin/python -c 'import cv2, numpy, pytesseract'"
+fi
+
+if sudo -u www-data "${INSTALL_DIR}/venv/bin/python" -c "import deepl" 2>/dev/null; then
+    success "deepl imports cleanly in the venv."
+else
+    warn "deepl did not import — translation will fall back to the OVHcloud models."
 fi
 
 # ── Step 7: Firewall ──────────────────────────────────────────────────────────

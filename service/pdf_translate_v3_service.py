@@ -94,6 +94,11 @@ import pymupdf as fitz
 import pdfplumber
 from flask import Flask, jsonify, request, send_file
 from openai import OpenAI
+
+try:                      # DeepL is the primary translation engine, but the
+    import deepl          # service must still start (and fall back to the
+except ImportError:       # OVHcloud models) if the package is missing.
+    deepl = None
 from PIL import Image
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -159,6 +164,43 @@ MAX_TRANSLATE_CHARS  = 20_000
 # and the second call buys nothing there.
 QA_EXEMPT_LANGUAGES = {"french", "german", "spanish", "italian", "english"}
 QA_MAX_FINDINGS_SHOWN = 15
+
+# --- DeepL (primary translation engine) --------------------------------------
+# DeepL translates the extracted text; OCR, language assessment and the QA pass
+# stay on the OVHcloud models. If DeepL cannot be used for any reason (no key,
+# quota, outage, unsupported language, output that looks untranslated) the job
+# falls back to the original Mistral/Llama translation path — a DeepL problem
+# must never fail a job that the old engine could have completed.
+#   TRANSLATE_ENGINE   "deepl" (default) or "llm" to switch DeepL off entirely.
+#   DEEPL_AUTH_KEY     the key. Free keys end ":fx"; the SDK picks the free or
+#                      pro endpoint from that, so there is no URL to configure.
+DEEPL_ENGINE_NAME        = "DeepL"
+TRANSLATE_ENGINE         = os.environ.get("TRANSLATE_ENGINE", "deepl").strip().lower()
+# DeepL caps a request body at 128 KiB. Non-Latin text can cost 6 bytes per
+# character once JSON-escaped, so 10k characters per request stays well inside.
+DEEPL_MAX_CHARS          = 10_000
+DEEPL_TIMEOUT_SECONDS    = 60
+DEEPL_MAX_RETRIES        = 3        # SDK retries 429 / 5xx with backoff
+DEEPL_COOLDOWN_SECONDS   = 600      # after an outage/auth/quota failure, skip DeepL this long
+DEEPL_MODEL_TYPE         = os.environ.get("DEEPL_MODEL_TYPE", "prefer_quality_optimized")
+DEEPL_ENGLISH_VARIANT    = os.environ.get("DEEPL_ENGLISH_VARIANT", "EN-GB").upper()
+
+# target_lang arrives as a language NAME ("English"); DeepL wants a code.
+DEEPL_TARGET_CODES = {
+    "english": DEEPL_ENGLISH_VARIANT, "british english": "EN-GB",
+    "american english": "EN-US", "french": "FR", "german": "DE", "spanish": "ES",
+    "italian": "IT", "dutch": "NL", "polish": "PL", "portuguese": "PT-PT",
+    "brazilian portuguese": "PT-BR", "russian": "RU", "ukrainian": "UK",
+    "turkish": "TR", "greek": "EL", "arabic": "AR", "hebrew": "HE",
+    "chinese": "ZH", "japanese": "JA", "korean": "KO", "czech": "CS",
+    "slovak": "SK", "slovenian": "SL", "hungarian": "HU", "romanian": "RO",
+    "bulgarian": "BG", "danish": "DA", "swedish": "SV", "norwegian": "NB",
+    "finnish": "FI", "estonian": "ET", "latvian": "LV", "lithuanian": "LT",
+    "indonesian": "ID", "thai": "TH", "vietnamese": "VI",
+}
+# Names the OCR assessment may use that differ from DeepL's own language names.
+DEEPL_SOURCE_ALIASES = {"farsi": "persian", "mandarin": "chinese",
+                        "cantonese": "chinese", "castilian": "spanish"}
 
 
 PORT = int(os.environ.get("TRANSLATE_PORT", 5107))
@@ -303,6 +345,27 @@ if not api_key:
 
 ovh_client = OpenAI(api_key=api_key or "anonymous", base_url=OVHCLOUD_BASE_URL)
 # Both models share the same OVHcloud endpoint — same client, different model strings
+
+DEEPL_AUTH_KEY = os.environ.get("DEEPL_AUTH_KEY", "").strip()
+deepl_client = None
+if TRANSLATE_ENGINE != "deepl":
+    log.info("TRANSLATE_ENGINE=%s — DeepL disabled, translating with OVHcloud models",
+             TRANSLATE_ENGINE)
+elif deepl is None:
+    log.warning("deepl package not installed — translating with OVHcloud models "
+                "(pip install deepl to enable DeepL)")
+elif not DEEPL_AUTH_KEY:
+    log.warning("DEEPL_AUTH_KEY not set — translating with OVHcloud models")
+else:
+    deepl_client = deepl.DeepLClient(
+        DEEPL_AUTH_KEY, timeout_s=DEEPL_TIMEOUT_SECONDS, max_retries=DEEPL_MAX_RETRIES,
+        send_platform_info=False,
+    )
+    if DEEPL_AUTH_KEY.endswith(":fx"):
+        log.warning("DEEPL_AUTH_KEY is a DeepL API *Free* key. Free-plan text may be "
+                    "retained by DeepL; use a Pro key for patient documents.")
+    log.info("DeepL enabled (%s plan) — OVHcloud models are the fallback",
+             "free" if DEEPL_AUTH_KEY.endswith(":fx") else "pro")
 
 # Static API key for inbound request authentication
 SERVICE_API_KEY = os.environ.get("TRANSLATE_API_KEY", "")
@@ -1383,6 +1446,189 @@ def _split_for_translation(text: str, max_chars: int = MAX_TRANSLATE_CHARS) -> l
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# DeepL translation engine (primary) — falls back to the model path below
+# ---------------------------------------------------------------------------
+
+class DeepLUnavailable(RuntimeError):
+    """
+    DeepL could not produce a usable translation. Never fatal: the caller logs
+    the reason, records it for the provenance line, and translates with the
+    OVHcloud models instead.
+    """
+
+
+_deepl_skip_until = 0.0            # cooldown after an outage / auth / quota failure
+_deepl_source_names: list[str] | None = None
+_MARKER_RE = re.compile(r"\[(?:ILLEGIBLE|UNCLEAR)\]", re.IGNORECASE)
+_LIST_START_RE = re.compile(r"^\s*([\-•·\*–—]|\(?\w{1,3}[.)]\s|\d+[.):]?\s)")
+
+
+def _deepl_target_code(target_lang: str) -> str | None:
+    key = target_lang.strip().lower()
+    if key in DEEPL_TARGET_CODES:
+        return DEEPL_TARGET_CODES[key]
+    if re.fullmatch(r"[a-z]{2}(-[a-z]{2,4})?", key):   # already a code, e.g. "de", "pt-br"
+        return {"EN": DEEPL_ENGLISH_VARIANT, "PT": "PT-PT"}.get(key.upper(), key.upper())
+    return None
+
+
+def _deepl_supports_source(language: str) -> bool:
+    """
+    True unless the OCR assessment named a language DeepL does not list as a
+    source. An unknown/empty language is allowed through — DeepL auto-detects,
+    and the untranslated-output check catches a miss.
+    """
+    global _deepl_source_names
+    name = (language or "").strip().lower()
+    if not name or name == "unknown":
+        return True
+    if _deepl_source_names is None:
+        _deepl_source_names = [l.name.lower().split()[0]
+                               for l in deepl_client.get_source_languages()]
+    for alias, canonical in DEEPL_SOURCE_ALIASES.items():
+        if alias in name:
+            name += " " + canonical
+    # An empty list means the lookup told us nothing — let DeepL try.
+    return not _deepl_source_names or any(n in name for n in _deepl_source_names)
+
+
+def _unwrap_soft_breaks(text: str) -> str:
+    """
+    Join lines that are one sentence hard-wrapped by the PDF or the OCR pass.
+
+    DeepL treats every newline as a sentence boundary (which is what keeps
+    lists and table rows on their own lines), so a paragraph wrapped at the
+    page margin would otherwise be translated as disconnected fragments. A
+    line is joined to the next only when it is prose-length for its paragraph,
+    does not end a sentence, and the next line does not start a list item —
+    short lines (headings, list items, table cells, lab rows) are left alone.
+    """
+    out_paras = []
+    for para in text.split("\n\n"):
+        lines = para.split("\n")
+        longest = max((len(l) for l in lines), default=0)
+        min_len = max(40, int(longest * 0.7))
+        joined: list[str] = []
+        for line in lines:
+            prev = joined[-1] if joined else ""
+            if (prev and line.strip()
+                    and len(prev) >= min_len
+                    and not prev.rstrip().endswith((".", ":", ";", "!", "?", "。"))
+                    and not _LIST_START_RE.match(line)):
+                if prev.endswith("-") and prev[-2:-1].isalpha() and line[:1].islower():
+                    joined[-1] = prev[:-1] + line.lstrip()      # de-hyphenate
+                else:
+                    joined[-1] = prev.rstrip() + " " + line.lstrip()
+            else:
+                joined.append(line)
+        out_paras.append("\n".join(joined))
+    return "\n\n".join(out_paras)
+
+
+def deepl_attestation(translated_text: str) -> str:
+    """Engine-accurate replacement for the attestation the models append."""
+    return (
+        "Translator's attestation: This translation was produced by DeepL machine "
+        "translation directly from the text of the source document; nothing was "
+        "added or summarised. Items marked [ILLEGIBLE] or [UNCLEAR] indicate text "
+        "that could not be read with certainty. Number of such items: "
+        f"{len(_MARKER_RE.findall(translated_text))}."
+    )
+
+
+def translate_with_deepl(text: str, target_lang: str, source_language: str = "") -> str:
+    """
+    Translate text with DeepL, preserving line and paragraph structure and the
+    '---PAGE BREAK---' markers. Raises DeepLUnavailable for anything short of a
+    complete, plausibly-translated result; the caller then uses the model path.
+    Does not append an attestation — callers add deepl_attestation() once.
+    """
+    global _deepl_skip_until
+
+    if deepl_client is None:
+        raise DeepLUnavailable("DeepL is not configured")
+    if time.time() < _deepl_skip_until:
+        raise DeepLUnavailable("DeepL is paused after a recent failure")
+
+    target_code = _deepl_target_code(target_lang)
+    if not target_code:
+        raise DeepLUnavailable(f"target language '{target_lang}' has no DeepL code")
+
+    pages = _clean_ocr_text(text).split("---PAGE BREAK---")
+    out_pages: list[str] = []
+    n_requests = 0
+    try:
+        if not _deepl_supports_source(source_language):
+            raise DeepLUnavailable(f"DeepL does not list '{source_language}' as a source language")
+
+        for page in pages:
+            out_chunks: list[str] = []
+            for chunk in _split_for_translation(_unwrap_soft_breaks(page.strip("\n")),
+                                                DEEPL_MAX_CHARS):
+                if not chunk.strip():
+                    out_chunks.append(chunk)
+                    continue
+                result = deepl_client.translate_text(
+                    chunk, target_lang=target_code,
+                    preserve_formatting=True,      # no silent punctuation/case "fixes"
+                    split_sentences="1",           # newlines are boundaries and are kept
+                    model_type=DEEPL_MODEL_TYPE or None,
+                )
+                n_requests += 1
+                if not result.text.strip():
+                    raise DeepLUnavailable("DeepL returned empty text for a non-empty chunk")
+                out_chunks.append(result.text)
+            out_pages.append("\n\n".join(out_chunks))
+
+    except DeepLUnavailable:
+        raise
+    except Exception as e:                         # deepl.DeepLException, network, anything
+        # Outage, bad key or exhausted quota: do not make every remaining
+        # batch of this (and the next) document wait on the same failure.
+        _deepl_skip_until = time.time() + DEEPL_COOLDOWN_SECONDS
+        raise DeepLUnavailable(f"{type(e).__name__}: {e}"[:300]) from e
+
+    translated = "\n\n---PAGE BREAK---\n\n".join(out_pages)
+    log.info("DeepL: %d chars in -> %d chars out (%s, %d request%s)",
+             len(text), len(translated), target_code, n_requests,
+             "" if n_requests == 1 else "s")
+    return translated
+
+
+def try_deepl(text: str, target_lang: str, assessment: dict,
+              model_override: str = "") -> str | None:
+    """
+    Attempt DeepL. Returns the translation, or None after recording why not in
+    assessment["deepl_fallback_reason"] (shown on the PDF provenance line).
+    An explicit model=mistral|llama request bypasses DeepL without comment.
+    """
+    if model_override or TRANSLATE_ENGINE != "deepl":
+        return None
+    source_language = str(assessment.get("language", ""))
+    try:
+        translated = translate_with_deepl(text, target_lang, source_language)
+        if _looks_untranslated(translated, source_language, text, search_whole=True):
+            raise DeepLUnavailable("DeepL output still contained the source text")
+    except DeepLUnavailable as e:
+        log.warning("DeepL not used — falling back to OVHcloud models: %s", e)
+        assessment["deepl_fallback_reason"] = str(e)
+        return None
+    assessment["translation_model"] = DEEPL_ENGINE_NAME
+    assessment.pop("escalation_reason", None)
+    return translated
+
+
+def _provenance_notes(assessment: dict) -> str:
+    """Suffix for the PDF provenance line: escalation and/or DeepL fallback."""
+    notes = ""
+    if assessment.get("escalation_reason"):
+        notes += f" (escalated — {assessment['escalation_reason']})"
+    if assessment.get("deepl_fallback_reason"):
+        notes += f" | DeepL not used: {assessment['deepl_fallback_reason']}"
+    return notes
+
+
 def translate_text_with_model(text: str, target_lang: str, model: str) -> str:
     """
     Translate extracted text using the specified model.
@@ -1637,6 +1883,11 @@ def translate_images(b64_images: list[str], target_lang: str, source_hint: str,
     if escalate:
         assessment["escalation_reason"] = reason
 
+    # DeepL first; the model path below is the fallback.
+    translation = try_deepl(extracted_text, target_lang, assessment, model_override)
+    if translation is not None:
+        return translation, assessment, False, extracted_text
+
     # Attempt translation — retry once with Llama if output looks untranslated
     for attempt in range(2):
         model_to_use = MODEL_LLAMA if (escalate or attempt > 0) else MODEL_MISTRAL
@@ -1836,6 +2087,8 @@ def translate_all_images(b64_images: list[str], target_lang: str, source_hint: s
     all_source_parts: list[str] = []
     final_assessment: dict = {}
     was_escalated = False
+    engines: list[str] = []          # translation engine used for each batch
+    fallback_reason = ""
 
     log.info("translate_all_images: %d page(s) in %d batch(es) of up to %d",
              total_pages, total_batches, MAX_IMAGES_PER_CALL)
@@ -1860,10 +2113,24 @@ def translate_all_images(b64_images: list[str], target_lang: str, source_hint: s
 
         if not final_assessment:
             final_assessment = assessment   # First batch's language assessment
+        engines.append(assessment.get("translation_model", ""))
+        if assessment.get("deepl_fallback_reason"):
+            fallback_reason = assessment["deepl_fallback_reason"]
         was_escalated = was_escalated or escalated
         all_text_parts.extend(
             part for part in text.split("---PAGE BREAK---") if part.strip()
         )
+
+    # Provenance must describe the whole document, not just the first batch:
+    # DeepL may have failed part-way and handed later batches to the models.
+    used = list(dict.fromkeys(e for e in engines if e))
+    if len(used) > 1:
+        final_assessment["translation_model"] = " + ".join(used)
+    if fallback_reason:
+        final_assessment["deepl_fallback_reason"] = fallback_reason
+    if DEEPL_ENGINE_NAME in used:
+        # The models append their own attestation; DeepL text gets one, once.
+        all_text_parts.append(deepl_attestation("\n".join(all_text_parts)))
 
     total_chars = sum(len(p) for p in all_text_parts)
     log.info("translate_all_images: %d fragment(s), %d chars total from %d page(s)",
@@ -1968,13 +2235,14 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
         tx_model   = assessment.get("translation_model", MODEL_MISTRAL)
         language   = assessment.get("language", "unknown")
         confidence = assessment.get("confidence", 0)
-        esc_reason = assessment.get("escalation_reason", "")
         if tx_model == ocr_model:
-            model_note = f"OCR + Translation: {tx_model} | Language: {language} (confidence {confidence:.0%})"
+            model_note = (f"OCR + Translation: {tx_model} | Language: {language} "
+                          f"(confidence {confidence:.0%})"
+                          + _xml(_provenance_notes(assessment)))
         else:
             model_note = (
                 f"OCR: {ocr_model} | Translation: {tx_model} | "
-                f"Language: {language} (escalated — {esc_reason})"
+                f"Language: {language}" + _xml(_provenance_notes(assessment))
             )
     else:
         model_note = f"Model: {MODEL_MISTRAL}"
@@ -2271,9 +2539,8 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
     if assessment:
         tx_model = assessment.get("translation_model", MODEL_LLAMA)
         language = assessment.get("language", "unknown")
-        esc = assessment.get("escalation_reason", "")
         model_note = (f"Translation: {tx_model} | Source language: {language}"
-                      + (f" (escalated — {esc})" if esc else ""))
+                      + _xml(_provenance_notes(assessment)))
     else:
         model_note = f"Translation: {MODEL_LLAMA}"
 
@@ -2375,7 +2642,12 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
             assessment["escalation_reason"] = reason
     assessment["translation_model"] = tx_model
 
-    translated = translate_preserving_layout(text, target_lang, tx_model)
+    # DeepL first; the model path is the fallback.
+    translated = try_deepl(text, target_lang, assessment, model_override)
+    if translated is not None:
+        translated += "\n\n" + deepl_attestation(translated)
+    else:
+        translated = translate_preserving_layout(text, target_lang, tx_model)
 
     run_qa(text, translated, assessment, target_lang, qa_mode)
 
@@ -2501,6 +2773,13 @@ def health():
     return jsonify({
         "status":               "ok",
         "ocr_model":            MODEL_MISTRAL,
+        "translation_engine":   DEEPL_ENGINE_NAME if deepl_client else "ovhcloud-models",
+        "deepl": {
+            "enabled":  deepl_client is not None,
+            "plan":     ("free" if DEEPL_AUTH_KEY.endswith(":fx") else "pro") if deepl_client else None,
+            "paused":   time.time() < _deepl_skip_until,
+        },
+        "fallback_models":      [MODEL_MISTRAL, MODEL_LLAMA],
         "translation_models":   [MODEL_MISTRAL, MODEL_LLAMA],
         "escalation_languages": sorted(ALWAYS_ESCALATE_LANGUAGES),
         "port":                 PORT,
