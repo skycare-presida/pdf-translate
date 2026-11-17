@@ -97,6 +97,20 @@ step "2/8  Python venv"
 
 SHARE_VENV=false
 VENV_SOURCE=""
+VENV_DIR="${INSTALL_DIR}/venv"
+UNIT_VENV=false
+
+# An installed unit is the authority on which venv the service really runs
+# from (on Ancilla it is .venv, not venv). Dependencies installed anywhere
+# else are invisible to the service, so follow the unit.
+if [[ -f "$SYSTEMD_UNIT" ]]; then
+    UNIT_GUNICORN=$(grep -oE '^ExecStart=[^ ]+/bin/gunicorn' "$SYSTEMD_UNIT" | head -1 | cut -d= -f2- || true)
+    if [[ -n "$UNIT_GUNICORN" && -x "$UNIT_GUNICORN" ]]; then
+        VENV_DIR="${UNIT_GUNICORN%/bin/gunicorn}"
+        UNIT_VENV=true
+        success "Installed service runs from ${VENV_DIR} — using that venv."
+    fi
+fi
 
 # Prefer v2 venv, fall back to v1
 for DIR in "$V2_INSTALL_DIR" "$V1_INSTALL_DIR"; do
@@ -106,7 +120,7 @@ for DIR in "$V2_INSTALL_DIR" "$V1_INSTALL_DIR"; do
     fi
 done
 
-if [[ -n "$VENV_SOURCE" ]]; then
+if ! $UNIT_VENV && [[ -n "$VENV_SOURCE" ]]; then
     info "Found existing venv at ${VENV_SOURCE}"
     read -rp "        Share this venv? [Y/n]: " SHARE
     SHARE="${SHARE:-Y}"
@@ -192,23 +206,31 @@ success "Files deployed."
 # ── Step 6: Venv ──────────────────────────────────────────────────────────────
 step "6/8  Python virtual environment"
 
-if [[ "$SHARE_VENV" == "true" ]]; then
-    ln -sfn "$VENV_SOURCE" "${INSTALL_DIR}/venv"
-    success "Symlinked ${VENV_SOURCE} → ${INSTALL_DIR}/venv"
+if $UNIT_VENV; then
+    # www-data may not own this venv; fall back to root (we are root).
+    if sudo -u www-data "${VENV_DIR}/bin/pip" install --quiet -r "${INSTALL_DIR}/requirements.txt" 2>/dev/null \
+        || "${VENV_DIR}/bin/pip" install --quiet -r "${INSTALL_DIR}/requirements.txt"; then
+        success "Dependencies are up to date in ${VENV_DIR}."
+    else
+        warn "Could not update ${VENV_DIR} — run: ${VENV_DIR}/bin/pip install -r ${INSTALL_DIR}/requirements.txt"
+    fi
+elif [[ "$SHARE_VENV" == "true" ]]; then
+    ln -sfn "$VENV_SOURCE" "${VENV_DIR}"
+    success "Symlinked ${VENV_SOURCE} → ${VENV_DIR}"
     # A shared venv predates newer dependencies (e.g. deepl) — top it up.
-    if sudo -u www-data "${INSTALL_DIR}/venv/bin/pip" install --quiet \
+    if sudo -u www-data "${VENV_DIR}/bin/pip" install --quiet \
         -r "${INSTALL_DIR}/requirements.txt"; then
         success "Shared venv dependencies are up to date."
     else
-        warn "Could not update the shared venv — run: ${INSTALL_DIR}/venv/bin/pip install -r ${INSTALL_DIR}/requirements.txt"
+        warn "Could not update the shared venv — run: ${VENV_DIR}/bin/pip install -r ${INSTALL_DIR}/requirements.txt"
     fi
 else
     if ! python3 -m venv --help &>/dev/null; then
         apt-get install -y python3-venv python3-pip
     fi
-    [[ ! -d "${INSTALL_DIR}/venv" ]] && sudo -u www-data python3 -m venv "${INSTALL_DIR}/venv"
-    sudo -u www-data "${INSTALL_DIR}/venv/bin/pip" install --quiet --upgrade pip
-    sudo -u www-data "${INSTALL_DIR}/venv/bin/pip" install --quiet \
+    [[ ! -d "${VENV_DIR}" ]] && sudo -u www-data python3 -m venv "${VENV_DIR}"
+    sudo -u www-data "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+    sudo -u www-data "${VENV_DIR}/bin/pip" install --quiet \
         -r "${INSTALL_DIR}/requirements.txt"
     success "Fresh venv created and dependencies installed."
 fi
@@ -218,16 +240,16 @@ fi
 # libraries are missing (by design — the service continues working), so a
 # missing cv2 or pytesseract shows up only later as "the Ukrainian scan
 # produced garbage". Catch it here instead.
-if sudo -u www-data "${INSTALL_DIR}/venv/bin/python" -c \
+if sudo -u www-data "${VENV_DIR}/bin/python" -c \
     "import cv2, numpy, pytesseract" 2>/dev/null; then
     success "OpenCV, numpy and pytesseract import cleanly in the venv."
 else
     warn "OpenCV / numpy / pytesseract did not import — OCR preprocessing"
     warn "and the Cyrillic fallback will be disabled. Service still runs."
-    warn "Debug with: ${INSTALL_DIR}/venv/bin/python -c 'import cv2, numpy, pytesseract'"
+    warn "Debug with: ${VENV_DIR}/bin/python -c 'import cv2, numpy, pytesseract'"
 fi
 
-if sudo -u www-data "${INSTALL_DIR}/venv/bin/python" -c "import deepl" 2>/dev/null; then
+if sudo -u www-data "${VENV_DIR}/bin/python" -c "import deepl" 2>/dev/null; then
     success "deepl imports cleanly in the venv."
 else
     warn "deepl did not import — translation will fall back to the OVHcloud models."

@@ -29,9 +29,18 @@ class FakeDeepL:
         self.fn = fn or (lambda t: "EN<" + t.upper() + ">")
         self.languages = languages
         self.calls = []
+        self.doc_fn = None          # whole-document translation off unless a test sets it
 
     def get_source_languages(self):
         return [SimpleNamespace(name=n, code=n[:2].upper()) for n in self.languages]
+
+    def translate_document(self, src, out, **kw):
+        self.doc_calls = getattr(self, "doc_calls", []) + [kw]
+        if self.doc_fn is None:
+            raise svc.deepl.DocumentTranslationException("document translation unavailable", None)
+        assert isinstance(src, bytes)        # the SDK ignores `filename` for file objects
+        out.write(self.doc_fn(src))
+        return SimpleNamespace(billed_characters=50000)
 
     def translate_text(self, text, **kw):
         self.calls.append((text, kw))
@@ -182,3 +191,79 @@ def test_scan_batches_mixed_engines_reported(monkeypatch):
     assert assessment["translation_model"] == f"DeepL + {svc.MODEL_MISTRAL}"
     assert "ConnectionError" in assessment["deepl_fallback_reason"]
     assert sum("produced by DeepL" in p for p in parts) == 1
+
+
+def test_formatted_text_pdf_keeps_lines_and_paragraph_gaps(monkeypatch):
+    """A well-laid-out text PDF must not come back as one squashed paragraph."""
+    _stub_assessment(monkeypatch)
+    doc = svc.fitz.open()
+    page = doc.new_page()
+    y = 60
+    for text, step in [("Entlassungsbericht der Klinik", 30),
+                       ("Patient: Hartley, James", 14), ("Geburtsdatum: 03.05.1961", 14),
+                       ("Aufnahme: 01.11.2026", 30),
+                       ("Der Patient wurde mit akuten Brustschmerzen in unsere Klinik aufgenommen", 14),
+                       ("und nach einer kardiologischen Abklärung auf die Normalstation verlegt.", 30),
+                       ("Ramipril 5 mg 1-0-0", 14), ("Bisoprolol 2,5 mg 1-0-1", 14)]:
+        page.insert_text((50, y), text, fontsize=10)
+        y += step
+    src = doc.tobytes()
+    doc.close()
+
+    text = svc.extract_text_layer(src)
+    assert text.count("\n\n") == 3                       # the three visible gaps
+    assert "Patient: Hartley, James\nGeburtsdatum: 03.05.1961\nAufnahme" in text
+
+    monkeypatch.setattr(svc, "deepl_client", FakeDeepL(fn=lambda t: t.swapcase()))
+    pdf, _ = svc.run_pipeline(src, ".pdf", "English", "", "A", qa_mode="off")
+    out = svc.fitz.open(stream=pdf, filetype="pdf")[0].get_text()
+    # field lines stay on separate lines; the wrapped sentence is one paragraph
+    assert "pATIENT: hARTLEY, jAMES\ngEBURTSDATUM: 03.05.1961\naUFNAHME: 01.11.2026" in out
+    assert "rAMIPRIL 5 MG 1-0-0\nbISOPROLOL 2,5 MG 1-0-1" in out
+    assert "AUFGENOMMEN UND NACH" in " ".join(out.split())
+
+
+def _translated_pdf(_src_bytes):
+    return _fitz_pdf(SOURCE.swapcase())
+
+
+def test_mode_a_whole_document_keeps_deepl_pdf(monkeypatch):
+    _stub_assessment(monkeypatch)
+    svc.deepl_client.doc_fn = _translated_pdf
+    pdf, _ = svc.run_pipeline(_fitz_pdf(SOURCE), ".pdf", "English", "", "A",
+                              uploaded_filename="Hartley_James.pdf", qa_mode="off")
+    doc = svc.fitz.open(stream=pdf, filetype="pdf")
+    assert len(doc) >= 3                                   # cover, translated page, originals
+    assert "whole document" in " ".join(doc[0].get_text().split())
+    assert "eNTLASSUNGSBERICHT" in doc[1].get_text()       # DeepL's own page, untouched
+    assert svc.deepl_client.calls == []                    # text API not used
+    assert svc.deepl_client.doc_calls[0]["filename"] == "document.pdf"   # patient name not sent
+
+
+@pytest.mark.parametrize("doc_fn", [
+    None,                                        # API error
+    lambda b: b,                                 # came back untranslated
+    lambda b: _fitz_pdf("x"),                    # most of the content lost
+    lambda b: b"not a pdf",
+])
+def test_whole_document_failure_falls_back_to_text_translation(monkeypatch, doc_fn):
+    _stub_assessment(monkeypatch)
+    svc.deepl_client.doc_fn = doc_fn
+    pdf, _ = svc.run_pipeline(_fitz_pdf(SOURCE), ".pdf", "English", "", "A", qa_mode="off")
+    text = _pdf_text(pdf)
+    assert "Translation: DeepL |" in text and "EN<" in text
+    assert len(svc.deepl_client.calls) >= 1
+
+
+def test_whole_document_respects_switch_and_page_limit(monkeypatch):
+    _stub_assessment(monkeypatch)
+    svc.deepl_client.doc_fn = _translated_pdf
+    monkeypatch.setattr(svc, "DEEPL_DOCUMENT_MAX_PAGES", 1)
+    two_pages = svc.fitz.open(stream=_fitz_pdf(SOURCE), filetype="pdf")
+    two_pages.insert_pdf(svc.fitz.open(stream=_fitz_pdf(SOURCE), filetype="pdf"))
+    svc.run_pipeline(two_pages.tobytes(), ".pdf", "English", "", "A", qa_mode="off")
+    assert not getattr(svc.deepl_client, "doc_calls", [])
+    monkeypatch.setattr(svc, "DEEPL_DOCUMENT_MAX_PAGES", 0)
+    monkeypatch.setattr(svc, "DEEPL_DOCUMENT_TRANSLATION", False)
+    svc.run_pipeline(_fitz_pdf(SOURCE), ".pdf", "English", "", "A", qa_mode="off")
+    assert not getattr(svc.deepl_client, "doc_calls", [])

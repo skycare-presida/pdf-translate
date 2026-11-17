@@ -185,6 +185,18 @@ DEEPL_COOLDOWN_SECONDS   = 600      # after an outage/auth/quota failure, skip D
 DEEPL_MODEL_TYPE         = os.environ.get("DEEPL_MODEL_TYPE", "prefer_quality_optimized")
 DEEPL_ENGLISH_VARIANT    = os.environ.get("DEEPL_ENGLISH_VARIANT", "EN-GB").upper()
 
+# Whole-document translation for text-layer PDFs (Mode A). DeepL translates the
+# PDF itself and returns a PDF in the ORIGINAL layout — fonts, tables, logos —
+# which is what the DeepL website does. Scans (Modes B/C) cannot use it: DeepL
+# does not OCR. DeepL bills a PDF at a minimum of 50,000 characters, so:
+#   DEEPL_DOCUMENT_TRANSLATION  "on" (default) or "off" to translate text only.
+#   DEEPL_DOCUMENT_MAX_PAGES    above this page count use text translation
+#                               instead (0 = no limit).
+DEEPL_DOCUMENT_TRANSLATION = os.environ.get("DEEPL_DOCUMENT_TRANSLATION", "on").strip().lower() == "on"
+DEEPL_DOCUMENT_MAX_PAGES   = int(os.environ.get("DEEPL_DOCUMENT_MAX_PAGES", "0") or 0)
+DEEPL_DOCUMENT_TIMEOUT     = 300      # seconds for upload + translate + download
+DEEPL_DOCUMENT_ENGINE_NAME = "DeepL (whole document, original layout)"
+
 # target_lang arrives as a language NAME ("English"); DeepL wants a code.
 DEEPL_TARGET_CODES = {
     "english": DEEPL_ENGLISH_VARIANT, "british english": "EN-GB",
@@ -1619,6 +1631,96 @@ def try_deepl(text: str, target_lang: str, assessment: dict,
     return translated
 
 
+def translate_pdf_with_deepl(pdf_bytes: bytes, target_lang: str,
+                             source_language: str = "") -> bytes:
+    """
+    Have DeepL translate the PDF itself, returning a PDF in the original
+    layout. Raises DeepLUnavailable on any problem; the caller then falls back
+    to text translation. The upload is named "document.pdf" so the patient's
+    file name is never sent.
+    """
+    global _deepl_skip_until
+
+    if deepl_client is None:
+        raise DeepLUnavailable("DeepL is not configured")
+    if time.time() < _deepl_skip_until:
+        raise DeepLUnavailable("DeepL is paused after a recent failure")
+    target_code = _deepl_target_code(target_lang)
+    if not target_code:
+        raise DeepLUnavailable(f"target language '{target_lang}' has no DeepL code")
+
+    out = io.BytesIO()
+    try:
+        if not _deepl_supports_source(source_language):
+            raise DeepLUnavailable(f"DeepL does not list '{source_language}' as a source language")
+        status = deepl_client.translate_document(
+            pdf_bytes, out, target_lang=target_code,   # raw bytes: the SDK only applies `filename` to bytes
+            filename="document.pdf", timeout_s=DEEPL_DOCUMENT_TIMEOUT,
+        )
+    except DeepLUnavailable:
+        raise
+    except Exception as e:
+        # A document-specific failure (unsupported PDF, too large) says nothing
+        # about the text API, so only a general failure pauses DeepL.
+        doc_error = deepl is not None and isinstance(e, deepl.DocumentTranslationException)
+        if not doc_error:
+            _deepl_skip_until = time.time() + DEEPL_COOLDOWN_SECONDS
+        raise DeepLUnavailable(f"document translation failed — {type(e).__name__}: {e}"[:300]) from e
+
+    result = out.getvalue()
+    if not result.startswith(b"%PDF"):
+        raise DeepLUnavailable("DeepL document translation did not return a PDF")
+    log.info("DeepL document: %d bytes in -> %d bytes out (%s, billed %s chars)",
+             len(pdf_bytes), len(result), target_code,
+             getattr(status, "billed_characters", "?"))
+    return result
+
+
+def try_deepl_document(pdf_bytes: bytes, source_text: str, target_lang: str,
+                       assessment: dict, model_override: str = "") -> tuple[bytes, str] | None:
+    """
+    Attempt whole-document translation of a text-layer PDF. Returns
+    (translated_pdf, translated_text) or None, in which case the caller uses
+    text translation. The translated text is read back out of DeepL's PDF so
+    the usual guards and the QA pass can check it against the source.
+    """
+    if model_override or TRANSLATE_ENGINE != "deepl" or not DEEPL_DOCUMENT_TRANSLATION:
+        return None
+    if deepl_client is None:
+        return None                     # try_deepl records the reason
+    source_language = str(assessment.get("language", ""))
+    try:
+        if DEEPL_DOCUMENT_MAX_PAGES:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            n_pages = len(doc)
+            doc.close()
+            if n_pages > DEEPL_DOCUMENT_MAX_PAGES:
+                raise DeepLUnavailable(f"{n_pages} pages is over DEEPL_DOCUMENT_MAX_PAGES")
+
+        translated_pdf = translate_pdf_with_deepl(pdf_bytes, target_lang, source_language)
+        translated_text = extract_text_layer(translated_pdf)
+
+        # A translation that lost most of the document, or is still the
+        # source, must not be shipped just because it looks tidy.
+        if len(translated_text.strip()) < 0.4 * len(source_text.strip()):
+            raise DeepLUnavailable(
+                f"translated PDF holds {len(translated_text)} chars of text against "
+                f"{len(source_text)} in the source")
+        if _looks_untranslated(translated_text, source_language, source_text, search_whole=True):
+            raise DeepLUnavailable("translated PDF still contained the source text")
+    except DeepLUnavailable as e:
+        log.warning("DeepL whole-document translation not used — trying text "
+                    "translation: %s", e)
+        return None
+    assessment["translation_model"] = DEEPL_DOCUMENT_ENGINE_NAME
+    assessment.pop("escalation_reason", None)
+    return translated_pdf, translated_text
+
+
+def _is_deepl_output(assessment: dict | None) -> bool:
+    return str((assessment or {}).get("translation_model", "")).startswith(DEEPL_ENGINE_NAME)
+
+
 def _provenance_notes(assessment: dict) -> str:
     """Suffix for the PDF provenance line: escalation and/or DeepL fallback."""
     notes = ""
@@ -2281,9 +2383,13 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
     ).replace("---PAGE BREAK---", "\n\n")
 
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
+    keep_lines = _is_deepl_output(assessment)   # see _build_text_translation_pdf
     for para in paragraphs:
         style = attestation_style if para.startswith("Translator") else body_style
-        story.append(Paragraph(_xml(para), style))
+        markup = _xml(para)
+        if keep_lines and style is body_style:
+            markup = "<br/>".join(l.strip() for l in markup.split("\n") if l.strip())
+        story.append(Paragraph(markup, style))
 
     # Verification outcome, rendered after the translation body
     story.extend(_qa_attestation_paragraphs(assessment, attestation_style))
@@ -2402,6 +2508,42 @@ def build_mode_c_pdf(b64_images: list[str], page_texts: list[str],
 # Main pipeline dispatcher
 # ---------------------------------------------------------------------------
 
+def _page_text_with_paragraph_gaps(page: fitz.Page) -> str:
+    """
+    Page text in reading order, one source line per line, with a blank line
+    wherever the page itself leaves a visible vertical gap.
+
+    Plain get_text("text") emits no blank lines at all, so every paragraph,
+    heading and field block on a well-laid-out page arrives as one unbroken
+    run of lines. The models used to re-invent the paragraph breaks; DeepL
+    translates exactly what it is given, so the breaks have to come from the
+    page geometry instead.
+    """
+    try:
+        blocks = page.get_text("dict").get("blocks", [])
+    except Exception:
+        return page.get_text("text")
+
+    out: list[str] = []
+    prev = None                                    # bbox of the previous text line
+    for block in blocks:
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", []))
+            if not text.strip():
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            if prev is not None:
+                gap = y0 - prev[3]
+                height = max(1.0, min(y1 - y0, prev[3] - prev[1]))
+                # Only a clear downward gap is a paragraph break. A negative
+                # gap is the same row (table cells) or the top of a new column.
+                if gap > 0.4 * height and out and out[-1] != "":
+                    out.append("")
+            out.append(text.rstrip())
+            prev = (x0, y0, x1, y1)
+    return "\n".join(out)
+
+
 def extract_text_layer(pdf_bytes: bytes) -> str:
     """
     Extract the text layer of a born-digital PDF, preserving the document's own
@@ -2415,9 +2557,7 @@ def extract_text_layer(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
     for page in doc:
-        # "text" preserves reading order and newlines; blank lines between
-        # paragraphs come through as they appear in the source.
-        pages.append(page.get_text("text"))
+        pages.append(_page_text_with_paragraph_gaps(page))
     doc.close()
     # A form feed between pages lets us drop page furniture later if needed;
     # for now double newline keeps paragraphs separated across page boundaries.
@@ -2573,6 +2713,11 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
             return False
         return bool(re.match(r"^([\-\u2022\*]|\(?[A-Z]?\d|\d+[.)])", s)) or " - " in s
 
+    # DeepL returns exactly the line structure it was sent (wrapped prose was
+    # already re-joined), so each line is a real line and must stay one. Model
+    # output is re-flowed as before, since the models wrap lines arbitrarily.
+    keep_lines = _is_deepl_output(assessment)
+
     # Split on blank lines into paragraph-ish groups, preserving inner newlines
     groups = re.split(r"\n\s*\n", translated_text)
     for group in groups:
@@ -2590,10 +2735,12 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
         # so the list structure survives; otherwise join wrapped lines into a
         # flowing paragraph.
         list_lines = sum(1 for l in stripped if looks_like_list_item(l))
-        if len(stripped) >= 2 and list_lines >= len(stripped) * 0.5:
+        if not keep_lines and len(stripped) >= 2 and list_lines >= len(stripped) * 0.5:
             for l in stripped:
                 story.append(Paragraph(_xml(l), list_style))
             story.append(Spacer(1, 2 * mm))
+        elif keep_lines:
+            story.append(Paragraph("<br/>".join(_xml(l) for l in stripped), body_style))
         else:
             story.append(Paragraph(" ".join(_xml(l) for l in stripped), body_style))
 
@@ -2642,7 +2789,25 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
             assessment["escalation_reason"] = reason
     assessment["translation_model"] = tx_model
 
-    # DeepL first; the model path is the fallback.
+    # Best result first: DeepL translating the PDF itself, original layout kept.
+    whole = try_deepl_document(file_bytes, text, target_lang, assessment, model_override)
+    if whole is not None:
+        translated_pdf, translated = whole
+        run_qa(text, translated, assessment, target_lang, qa_mode)
+        cover = _build_text_translation_pdf(
+            "The translated document follows on the next page, in the layout of "
+            "the original.\n\n" + deepl_attestation(translated),
+            uploaded_filename, target_lang, assessment)
+        pdf = _merge_pdfs(cover, translated_pdf)
+        try:
+            originals_pdf = _build_originals_section(
+                get_all_page_images(original_input), uploaded_filename)
+            return _merge_pdfs(pdf, originals_pdf)
+        except Exception as e:
+            log.warning("Mode A: could not append original pages: %s", e)
+            return pdf
+
+    # Next: DeepL translating the extracted text; the model path is the fallback.
     translated = try_deepl(text, target_lang, assessment, model_override)
     if translated is not None:
         translated += "\n\n" + deepl_attestation(translated)
@@ -2778,6 +2943,8 @@ def health():
             "enabled":  deepl_client is not None,
             "plan":     ("free" if DEEPL_AUTH_KEY.endswith(":fx") else "pro") if deepl_client else None,
             "paused":   time.time() < _deepl_skip_until,
+            "whole_document_pdf": DEEPL_DOCUMENT_TRANSLATION,
+            "whole_document_max_pages": DEEPL_DOCUMENT_MAX_PAGES or None,
         },
         "fallback_models":      [MODEL_MISTRAL, MODEL_LLAMA],
         "translation_models":   [MODEL_MISTRAL, MODEL_LLAMA],
