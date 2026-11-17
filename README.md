@@ -55,6 +55,25 @@ headings and table rows stay one per line), is split into 10,000-character
 requests to stay inside DeepL's 128 KiB limit, and relies on the SDK's
 backoff for rate limits (HTTP 429) and transient errors.
 
+**Text PDFs keep their original layout.** For a PDF with a real text layer
+(Mode A) the service first asks DeepL to translate the PDF itself, which is
+what the DeepL website does: the result is a PDF with the original fonts,
+tables and logos, in the target language. The service adds a cover page
+(provenance, attestation, QA result) in front and the untouched original
+pages behind. The translated text is read back out of DeepL's PDF so the
+untranslated-output guard and the QA pass still check it against the source.
+If whole-document translation fails, or loses most of the text, the job
+drops to translating the extracted text instead (below). DeepL bills a PDF
+at a minimum of 50,000 characters; `DEEPL_DOCUMENT_TRANSLATION=off` turns
+this off and `DEEPL_DOCUMENT_MAX_PAGES=N` limits it to shorter documents.
+The upload is named `document.pdf`, so the patient's file name is not sent.
+Scans and photos (Modes B/C) cannot use this — DeepL does not OCR.
+
+**Text translation keeps lines and paragraphs.** Where the text is translated
+rather than the file, paragraph breaks are taken from the vertical gaps on
+the source page and every line of DeepL's output is rendered as its own line,
+so a well-laid-out document does not come back as one block of text.
+
 **Fallback to the OVHcloud models.** If DeepL is not configured, errors
 (outage, bad key, quota exhausted), does not support the source or target
 language, returns nothing, or returns text that still looks like the source,
