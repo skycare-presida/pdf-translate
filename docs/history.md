@@ -204,3 +204,17 @@ Two failure classes get distinct error PDFs: `UnreadableScan`
 ("Scan quality too low for OCR — a clearer scan, or manual
 translation, is needed") and everything else ("Translation could
 not be completed").
+
+## DeepL as the translation engine (Nov 2026)
+
+Translation moved from the OVHcloud models to DeepL, which is stronger and
+more consistent on the European languages that make up most of the
+workload. Everything else stayed: Mistral still does OCR and language
+assessment, the QA pass still runs, and the PDF builders are untouched.
+
+The old Mistral/Llama translation path was kept as an automatic fallback
+rather than removed. A DeepL outage, an exhausted quota or a language
+DeepL does not cover must not turn into a failed job when the previous
+engine could have translated the document. Every fallback is named on
+the PDF's provenance line so the reader knows which engine produced the
+text in front of them.

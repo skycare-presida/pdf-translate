@@ -1,5 +1,5 @@
 [Unit]
-Description=SkyCare PDF Translation Service v3 — Async Queue (OVHcloud/Mistral+Llama)
+Description=SkyCare PDF Translation Service v3 — Async Queue (DeepL, OVHcloud Mistral+Llama fallback)
 After=network.target
 Wants=network-online.target
 

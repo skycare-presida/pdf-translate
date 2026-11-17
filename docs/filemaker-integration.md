@@ -96,7 +96,7 @@ Everything except `file` is optional:
 | `file` | the PDF or image | Required. See cURL gotcha below. |
 | `target_lang` | any language name, e.g. `English`, `French` | Default `English` |
 | `mode` | `A` / `B` / `C` / `AUTO` | Default `AUTO` (detect text layer, scan, photo) |
-| `model` | `mistral` / `llama` / empty | Empty = auto-select by language and confidence |
+| `model` | `mistral` / `llama` / empty | Empty = DeepL, falling back to an auto-selected OVHcloud model. `mistral` or `llama` skips DeepL and forces that model |
 | `qa` | `auto` / `on` / `off` | Default `auto` (skip for high-resource European languages) |
 | `source_hint` | free text | Optional context, e.g. "Turkish hospital discharge summary" |
 | `jobID` / `job_id` | client-generated UUID | Either name accepted; use client-side ID so Presida can log before the submit returns |

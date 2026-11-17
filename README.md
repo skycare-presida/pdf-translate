@@ -5,10 +5,12 @@ missions. It is called from Presida (the FileMaker-based case management
 system) when a case requires a foreign-language discharge summary, imaging
 report or similar to be made readable for the receiving clinical team.
 
-All inference runs on EU-hosted endpoints (OVHcloud AI Endpoints: Mistral +
-Llama) so that patient data never leaves the European Economic Area, keeping
-the pipeline inside the organisation's GDPR posture. No document ever touches
-US-hosted model APIs.
+Translation is done by DeepL (API Pro), with the OVHcloud models as an
+automatic fallback. OCR, language assessment and the QA pass run on EU-hosted
+OVHcloud AI Endpoints (Mistral + Llama). DeepL SE is a German company; with a
+Pro key the text is processed for the translation only and not retained —
+confirm the data-processing terms on the DeepL account before relying on
+that. Do not use a DeepL API Free key (`...:fx`) for patient documents.
 
 The service is deliberately opinionated about what it will and will not do.
 Several design choices below exist because a wrong medical translation is
@@ -44,7 +46,36 @@ model. In practice the distinction between B and C is modest — they share
 most of the code path — but C's pre-handling catches phone-camera-specific
 problems B doesn't need to worry about.
 
+## Translation engine
+
+**DeepL first.** Once the text has been extracted (text layer or OCR), it is
+translated by DeepL. The request keeps the source's line structure (hard-
+wrapped prose is re-joined first so sentences are translated whole; lists,
+headings and table rows stay one per line), is split into 10,000-character
+requests to stay inside DeepL's 128 KiB limit, and relies on the SDK's
+backoff for rate limits (HTTP 429) and transient errors.
+
+**Fallback to the OVHcloud models.** If DeepL is not configured, errors
+(outage, bad key, quota exhausted), does not support the source or target
+language, returns nothing, or returns text that still looks like the source,
+the job carries on with the original Mistral/Llama path described below —
+it does not fail. The reason is logged and printed on the PDF's provenance
+line ("DeepL not used: ..."), and after an outage/auth/quota error DeepL is
+skipped for 10 minutes so a long document does not wait on every batch.
+
+`model=mistral|llama` on a request skips DeepL for that job, and
+`TRANSLATE_ENGINE=llm` in `.env` switches it off entirely. `/health` reports
+which engine is active.
+
+What DeepL does not do: it cannot follow the fidelity prompt, so the
+translator's brace notes (`{sic}`, INN expansions, kept-original
+institution names) only appear on fallback translations. `[ILLEGIBLE]`
+markers from OCR are carried through and counted in the attestation. The QA
+pass is unchanged and now checks DeepL's output with an independent model.
+
 ## Model routing
+
+These rules pick the fallback translation model (and Mistral always does OCR).
 
 Two models, selected per document:
 
@@ -147,7 +178,7 @@ Authentication: `Authorization: Bearer <TRANSLATE_API_KEY>`.
 ```
 ├── README.md                       — this file
 ├── install.sh                      — idempotent installer (run as root on Ancilla)
-├── .env.example                    — template for the two API keys
+├── .env.example                    — template for the API keys
 ├── service/
 │   ├── pdf_translate_v3_service.py — the service itself (~2700 lines)
 │   └── requirements.txt            — Python dependencies
@@ -156,6 +187,8 @@ Authentication: `Authorization: Bearer <TRANSLATE_API_KEY>`.
 └── docs/
     ├── history.md                  — why the service looks the way it does
     └── filemaker-integration.md    — calling the service from Presida
+tests/
+└── test_deepl_engine.py            — DeepL engine + fallback tests (pytest, no network)
 ```
 
 ## Deployment
@@ -182,7 +215,8 @@ The installer is idempotent and safe to re-run. It:
 - reuses the v1 or v2 venv by symlink if present (saves ~400 MB and ~2 min)
 - inherits API keys from an existing `/opt/skycare/pdf-translate*/env` file
   if it exists, otherwise prompts for the OVHcloud key and generates a new
-  inbound `TRANSLATE_API_KEY`
+  inbound `TRANSLATE_API_KEY`; inherits `DEEPL_AUTH_KEY` the same way or
+  prompts for it (Enter skips — the service then uses the OVHcloud models)
 - creates `/opt/skycare/pdf-translate-v3/`, `/var/log/skycare/`, and
   `/tmp/skycare-jobs/` with the right ownership and modes
 - deploys the service file, `.env` (mode 600), systemd unit, and starts it
@@ -203,6 +237,11 @@ sudo cp service/pdf_translate_v3_service.py /opt/skycare/pdf-translate-v3/
 sudo chown www-data:www-data /opt/skycare/pdf-translate-v3/pdf_translate_v3_service.py
 sudo systemctl restart skycare-pdf-translate-v3
 ```
+
+If `requirements.txt` changed (e.g. the `deepl` package), also run
+`sudo -u www-data /opt/skycare/pdf-translate-v3/venv/bin/pip install -r service/requirements.txt`
+before the restart. Without the package the service still runs, on the
+fallback models.
 
 ### Ancilla systemd gotchas
 
