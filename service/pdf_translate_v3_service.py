@@ -197,6 +197,18 @@ DEEPL_DOCUMENT_MAX_PAGES   = int(os.environ.get("DEEPL_DOCUMENT_MAX_PAGES", "0")
 DEEPL_DOCUMENT_TIMEOUT     = 300      # seconds for upload + translate + download
 DEEPL_DOCUMENT_ENGINE_NAME = "DeepL (whole document, original layout)"
 
+# One short statement printed on every DeepL translation. The claims are those
+# DeepL makes on deepl.com/pro-data-security (checked Nov 2026): SOC 2 Type II,
+# alignment with EU data protection law, and that texts are never stored or
+# used for model training without consent. Override with DEEPL_BOILERPLATE.
+# Must start "Translated by DeepL" — the PDF builders style it by that prefix.
+DEEPL_BOILERPLATE = os.environ.get("DEEPL_BOILERPLATE", "").strip() or (
+    "Translated by DeepL, a machine translation service certified to SOC 2 "
+    "Type II and aligned with EU data protection law (GDPR). The text is not "
+    "stored by DeepL or used to train its models."
+)
+_NOTE_PREFIXES = ("Translator", "Translated by DeepL")
+
 # target_lang arrives as a language NAME ("English"); DeepL wants a code.
 DEEPL_TARGET_CODES = {
     "english": DEEPL_ENGLISH_VARIANT, "british english": "EN-GB",
@@ -1538,15 +1550,17 @@ def _unwrap_soft_breaks(text: str) -> str:
     return "\n\n".join(out_paras)
 
 
-def deepl_attestation(translated_text: str) -> str:
-    """Engine-accurate replacement for the attestation the models append."""
-    return (
-        "Translator's attestation: This translation was produced by DeepL machine "
-        "translation directly from the text of the source document; nothing was "
-        "added or summarised. Items marked [ILLEGIBLE] or [UNCLEAR] indicate text "
-        "that could not be read with certainty. Number of such items: "
-        f"{len(_MARKER_RE.findall(translated_text))}."
-    )
+def deepl_attestation(translated_text: str = "", ocr_markers: bool = False) -> str:
+    """
+    The short statement printed on a DeepL translation. With ocr_markers
+    (scans only) it also counts the [ILLEGIBLE] marks the OCR step left —
+    DeepL itself never marks uncertain text, so nothing more is claimed.
+    """
+    note = DEEPL_BOILERPLATE
+    if ocr_markers:
+        note += (" Items marked [ILLEGIBLE] could not be read from the scan. "
+                 f"Number of such items: {len(_MARKER_RE.findall(translated_text))}.")
+    return note
 
 
 def translate_with_deepl(text: str, target_lang: str, source_language: str = "") -> str:
@@ -2232,7 +2246,7 @@ def translate_all_images(b64_images: list[str], target_lang: str, source_hint: s
         final_assessment["deepl_fallback_reason"] = fallback_reason
     if DEEPL_ENGINE_NAME in used:
         # The models append their own attestation; DeepL text gets one, once.
-        all_text_parts.append(deepl_attestation("\n".join(all_text_parts)))
+        all_text_parts.append(deepl_attestation("\n".join(all_text_parts), ocr_markers=True))
 
     total_chars = sum(len(p) for p in all_text_parts)
     log.info("translate_all_images: %d fragment(s), %d chars total from %d page(s)",
@@ -2385,7 +2399,7 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
     keep_lines = _is_deepl_output(assessment)   # see _build_text_translation_pdf
     for para in paragraphs:
-        style = attestation_style if para.startswith("Translator") else body_style
+        style = attestation_style if para.startswith(_NOTE_PREFIXES) else body_style
         markup = _xml(para)
         if keep_lines and style is body_style:
             markup = "<br/>".join(l.strip() for l in markup.split("\n") if l.strip())
@@ -2727,7 +2741,7 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
             story.append(Spacer(1, 3 * mm))
             continue
 
-        if stripped and stripped[0].startswith("Translator"):
+        if stripped and stripped[0].startswith(_NOTE_PREFIXES):
             story.append(Paragraph("<br/>".join(_xml(l) for l in stripped), attest_style))
             continue
 
@@ -2794,10 +2808,11 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
     if whole is not None:
         translated_pdf, translated = whole
         run_qa(text, translated, assessment, target_lang, qa_mode)
+        # Cover page = provenance line, the DeepL statement and QA outcome. No
+        # [ILLEGIBLE]/[UNCLEAR] count: DeepL never marks uncertain text, so a
+        # count would claim a check that did not happen.
         cover = _build_text_translation_pdf(
-            "The translated document follows on the next page, in the layout of "
-            "the original.\n\n" + deepl_attestation(translated),
-            uploaded_filename, target_lang, assessment)
+            deepl_attestation(), uploaded_filename, target_lang, assessment)
         pdf = _merge_pdfs(cover, translated_pdf)
         try:
             originals_pdf = _build_originals_section(
@@ -2809,15 +2824,16 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
 
     # Next: DeepL translating the extracted text; the model path is the fallback.
     translated = try_deepl(text, target_lang, assessment, model_override)
-    if translated is not None:
-        translated += "\n\n" + deepl_attestation(translated)
-    else:
+    deepl_note = ""
+    if translated is None:
         translated = translate_preserving_layout(text, target_lang, tx_model)
+    else:
+        deepl_note = "\n\n" + deepl_attestation()
 
     run_qa(text, translated, assessment, target_lang, qa_mode)
 
     translation_pdf = _build_text_translation_pdf(
-        translated, uploaded_filename, target_lang, assessment)
+        translated + deepl_note, uploaded_filename, target_lang, assessment)
 
     # Append the untouched original pages
     try:

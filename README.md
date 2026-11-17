@@ -59,7 +59,7 @@ backoff for rate limits (HTTP 429) and transient errors.
 (Mode A) the service first asks DeepL to translate the PDF itself, which is
 what the DeepL website does: the result is a PDF with the original fonts,
 tables and logos, in the target language. The service adds a cover page
-(provenance, attestation, QA result) in front and the untouched original
+(provenance, a one-line DeepL statement, QA result) in front and the untouched original
 pages behind. The translated text is read back out of DeepL's PDF so the
 untranslated-output guard and the QA pass still check it against the source.
 If whole-document translation fails, or loses most of the text, the job
@@ -89,7 +89,7 @@ which engine is active.
 What DeepL does not do: it cannot follow the fidelity prompt, so the
 translator's brace notes (`{sic}`, INN expansions, kept-original
 institution names) only appear on fallback translations. `[ILLEGIBLE]`
-markers from OCR are carried through and counted in the attestation. The QA
+markers from OCR are carried through and counted in the note on scanned documents. The QA
 pass is unchanged and now checks DeepL's output with an independent model.
 
 ## Model routing

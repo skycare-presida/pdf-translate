@@ -158,7 +158,9 @@ def test_mode_a_end_to_end_with_deepl(monkeypatch):
     text = _pdf_text(pdf)
     assert mode == "A"
     assert "Translation: DeepL" in text and "EN<" in text
-    assert "produced by DeepL machine translation" in text
+    # short DeepL statement; no OCR ran on a text PDF, so no [ILLEGIBLE] count
+    assert "Translated by DeepL, a machine translation service" in text
+    assert "attestation" not in text and "ILLEGIBLE" not in text
 
 
 def test_mode_a_end_to_end_falls_back_to_models(monkeypatch):
@@ -190,7 +192,8 @@ def test_scan_batches_mixed_engines_reported(monkeypatch):
     parts, assessment, _, _ = svc.translate_all_images(["img1", "img2"], "English", "")
     assert assessment["translation_model"] == f"DeepL + {svc.MODEL_MISTRAL}"
     assert "ConnectionError" in assessment["deepl_fallback_reason"]
-    assert sum("produced by DeepL" in p for p in parts) == 1
+    notes = [p for p in parts if p.startswith("Translated by DeepL")]
+    assert len(notes) == 1 and "Number of such items: 0." in notes[0]
 
 
 def test_formatted_text_pdf_keeps_lines_and_paragraph_gaps(monkeypatch):
@@ -235,6 +238,9 @@ def test_mode_a_whole_document_keeps_deepl_pdf(monkeypatch):
     doc = svc.fitz.open(stream=pdf, filetype="pdf")
     assert len(doc) >= 3                                   # cover, translated page, originals
     assert "whole document" in " ".join(doc[0].get_text().split())
+    cover = " ".join(doc[0].get_text().split())
+    assert "attestation" not in cover and "follows on the next page" not in cover
+    assert "Translated by DeepL, a machine translation service" in cover and "ILLEGIBLE" not in cover
     assert "eNTLASSUNGSBERICHT" in doc[1].get_text()       # DeepL's own page, untouched
     assert svc.deepl_client.calls == []                    # text API not used
     assert svc.deepl_client.doc_calls[0]["filename"] == "document.pdf"   # patient name not sent
