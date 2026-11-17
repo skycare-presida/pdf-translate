@@ -182,3 +182,33 @@ def test_scan_batches_mixed_engines_reported(monkeypatch):
     assert assessment["translation_model"] == f"DeepL + {svc.MODEL_MISTRAL}"
     assert "ConnectionError" in assessment["deepl_fallback_reason"]
     assert sum("produced by DeepL" in p for p in parts) == 1
+
+
+def test_formatted_text_pdf_keeps_lines_and_paragraph_gaps(monkeypatch):
+    """A well-laid-out text PDF must not come back as one squashed paragraph."""
+    _stub_assessment(monkeypatch)
+    doc = svc.fitz.open()
+    page = doc.new_page()
+    y = 60
+    for text, step in [("Entlassungsbericht der Klinik", 30),
+                       ("Patient: Hartley, James", 14), ("Geburtsdatum: 03.05.1961", 14),
+                       ("Aufnahme: 01.11.2026", 30),
+                       ("Der Patient wurde mit akuten Brustschmerzen in unsere Klinik aufgenommen", 14),
+                       ("und nach einer kardiologischen Abklärung auf die Normalstation verlegt.", 30),
+                       ("Ramipril 5 mg 1-0-0", 14), ("Bisoprolol 2,5 mg 1-0-1", 14)]:
+        page.insert_text((50, y), text, fontsize=10)
+        y += step
+    src = doc.tobytes()
+    doc.close()
+
+    text = svc.extract_text_layer(src)
+    assert text.count("\n\n") == 3                       # the three visible gaps
+    assert "Patient: Hartley, James\nGeburtsdatum: 03.05.1961\nAufnahme" in text
+
+    monkeypatch.setattr(svc, "deepl_client", FakeDeepL(fn=lambda t: t.swapcase()))
+    pdf, _ = svc.run_pipeline(src, ".pdf", "English", "", "A", qa_mode="off")
+    out = svc.fitz.open(stream=pdf, filetype="pdf")[0].get_text()
+    # field lines stay on separate lines; the wrapped sentence is one paragraph
+    assert "pATIENT: hARTLEY, jAMES\ngEBURTSDATUM: 03.05.1961\naUFNAHME: 01.11.2026" in out
+    assert "rAMIPRIL 5 MG 1-0-0\nbISOPROLOL 2,5 MG 1-0-1" in out
+    assert "AUFGENOMMEN UND NACH" in " ".join(out.split())

@@ -1619,6 +1619,10 @@ def try_deepl(text: str, target_lang: str, assessment: dict,
     return translated
 
 
+def _is_deepl_output(assessment: dict | None) -> bool:
+    return str((assessment or {}).get("translation_model", "")).startswith(DEEPL_ENGINE_NAME)
+
+
 def _provenance_notes(assessment: dict) -> str:
     """Suffix for the PDF provenance line: escalation and/or DeepL fallback."""
     notes = ""
@@ -2281,9 +2285,13 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
     ).replace("---PAGE BREAK---", "\n\n")
 
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
+    keep_lines = _is_deepl_output(assessment)   # see _build_text_translation_pdf
     for para in paragraphs:
         style = attestation_style if para.startswith("Translator") else body_style
-        story.append(Paragraph(_xml(para), style))
+        markup = _xml(para)
+        if keep_lines and style is body_style:
+            markup = "<br/>".join(l.strip() for l in markup.split("\n") if l.strip())
+        story.append(Paragraph(markup, style))
 
     # Verification outcome, rendered after the translation body
     story.extend(_qa_attestation_paragraphs(assessment, attestation_style))
@@ -2402,6 +2410,42 @@ def build_mode_c_pdf(b64_images: list[str], page_texts: list[str],
 # Main pipeline dispatcher
 # ---------------------------------------------------------------------------
 
+def _page_text_with_paragraph_gaps(page: fitz.Page) -> str:
+    """
+    Page text in reading order, one source line per line, with a blank line
+    wherever the page itself leaves a visible vertical gap.
+
+    Plain get_text("text") emits no blank lines at all, so every paragraph,
+    heading and field block on a well-laid-out page arrives as one unbroken
+    run of lines. The models used to re-invent the paragraph breaks; DeepL
+    translates exactly what it is given, so the breaks have to come from the
+    page geometry instead.
+    """
+    try:
+        blocks = page.get_text("dict").get("blocks", [])
+    except Exception:
+        return page.get_text("text")
+
+    out: list[str] = []
+    prev = None                                    # bbox of the previous text line
+    for block in blocks:
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", []))
+            if not text.strip():
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            if prev is not None:
+                gap = y0 - prev[3]
+                height = max(1.0, min(y1 - y0, prev[3] - prev[1]))
+                # Only a clear downward gap is a paragraph break. A negative
+                # gap is the same row (table cells) or the top of a new column.
+                if gap > 0.4 * height and out and out[-1] != "":
+                    out.append("")
+            out.append(text.rstrip())
+            prev = (x0, y0, x1, y1)
+    return "\n".join(out)
+
+
 def extract_text_layer(pdf_bytes: bytes) -> str:
     """
     Extract the text layer of a born-digital PDF, preserving the document's own
@@ -2415,9 +2459,7 @@ def extract_text_layer(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
     for page in doc:
-        # "text" preserves reading order and newlines; blank lines between
-        # paragraphs come through as they appear in the source.
-        pages.append(page.get_text("text"))
+        pages.append(_page_text_with_paragraph_gaps(page))
     doc.close()
     # A form feed between pages lets us drop page furniture later if needed;
     # for now double newline keeps paragraphs separated across page boundaries.
@@ -2573,6 +2615,11 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
             return False
         return bool(re.match(r"^([\-\u2022\*]|\(?[A-Z]?\d|\d+[.)])", s)) or " - " in s
 
+    # DeepL returns exactly the line structure it was sent (wrapped prose was
+    # already re-joined), so each line is a real line and must stay one. Model
+    # output is re-flowed as before, since the models wrap lines arbitrarily.
+    keep_lines = _is_deepl_output(assessment)
+
     # Split on blank lines into paragraph-ish groups, preserving inner newlines
     groups = re.split(r"\n\s*\n", translated_text)
     for group in groups:
@@ -2590,10 +2637,12 @@ def _build_text_translation_pdf(translated_text: str, source_filename: str,
         # so the list structure survives; otherwise join wrapped lines into a
         # flowing paragraph.
         list_lines = sum(1 for l in stripped if looks_like_list_item(l))
-        if len(stripped) >= 2 and list_lines >= len(stripped) * 0.5:
+        if not keep_lines and len(stripped) >= 2 and list_lines >= len(stripped) * 0.5:
             for l in stripped:
                 story.append(Paragraph(_xml(l), list_style))
             story.append(Spacer(1, 2 * mm))
+        elif keep_lines:
+            story.append(Paragraph("<br/>".join(_xml(l) for l in stripped), body_style))
         else:
             story.append(Paragraph(" ".join(_xml(l) for l in stripped), body_style))
 
