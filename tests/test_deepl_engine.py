@@ -158,7 +158,8 @@ def test_mode_a_end_to_end_with_deepl(monkeypatch):
     text = _pdf_text(pdf)
     assert mode == "A"
     assert "Translation: DeepL" in text and "EN<" in text
-    assert "produced by DeepL machine translation" in text
+    # no OCR ran on a text PDF, so no [ILLEGIBLE] count is claimed
+    assert "attestation" not in text
 
 
 def test_mode_a_end_to_end_falls_back_to_models(monkeypatch):
@@ -235,6 +236,8 @@ def test_mode_a_whole_document_keeps_deepl_pdf(monkeypatch):
     doc = svc.fitz.open(stream=pdf, filetype="pdf")
     assert len(doc) >= 3                                   # cover, translated page, originals
     assert "whole document" in " ".join(doc[0].get_text().split())
+    cover = " ".join(doc[0].get_text().split())
+    assert "attestation" not in cover and "follows on the next page" not in cover
     assert "eNTLASSUNGSBERICHT" in doc[1].get_text()       # DeepL's own page, untouched
     assert svc.deepl_client.calls == []                    # text API not used
     assert svc.deepl_client.doc_calls[0]["filename"] == "document.pdf"   # patient name not sent

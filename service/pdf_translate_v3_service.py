@@ -2794,10 +2794,11 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
     if whole is not None:
         translated_pdf, translated = whole
         run_qa(text, translated, assessment, target_lang, qa_mode)
+        # Cover page = provenance line and QA outcome only. No attestation:
+        # DeepL never marks [ILLEGIBLE]/[UNCLEAR], so a count of them would
+        # claim a check that did not happen.
         cover = _build_text_translation_pdf(
-            "The translated document follows on the next page, in the layout of "
-            "the original.\n\n" + deepl_attestation(translated),
-            uploaded_filename, target_lang, assessment)
+            "", uploaded_filename, target_lang, assessment)
         pdf = _merge_pdfs(cover, translated_pdf)
         try:
             originals_pdf = _build_originals_section(
@@ -2809,9 +2810,7 @@ def run_mode_a_textlayer(file_bytes: bytes, original_input: bytes,
 
     # Next: DeepL translating the extracted text; the model path is the fallback.
     translated = try_deepl(text, target_lang, assessment, model_override)
-    if translated is not None:
-        translated += "\n\n" + deepl_attestation(translated)
-    else:
+    if translated is None:
         translated = translate_preserving_layout(text, target_lang, tx_model)
 
     run_qa(text, translated, assessment, target_lang, qa_mode)
