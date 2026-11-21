@@ -134,6 +134,19 @@ timeout (default 5 minutes, below the HTTP client's silent 10-minute
 default), and a fast-fail path that returns an `UnreadableScan` with an
 explanation rather than pretending to have read the page.
 
+**Local OCR fallback for any runaway page.** If the vision model runs to its
+output cap or times out on a single page — it is rambling, not transcribing —
+that page is read locally with Tesseract instead of failing the document
+(script detected per page; Latin, Cyrillic, Greek, Arabic and Hebrew packs
+are installed). A page on which Tesseract finds almost no words is taken to
+be a photo, image or blank page: the translation carries a visible "no
+machine-readable text — see the original" marker for it and the cover line
+says so in capitals. The job still fails as `UnreadableScan` if no page in
+the document is readable or if Tesseract also over-produces. OCR calls are
+budgeted at 6,000 output tokens per page, so a runaway page is caught in
+about a third of the time it used to take. The cover line names any pages
+read by local OCR.
+
 **Cyrillic Tesseract fallback.** When Mistral over-produces on a scan it
 has identified as Cyrillic script, the service retries the OCR step
 locally with Tesseract (`ukr+rus+bul+srp+mkd+bel+kaz+eng`) before giving
