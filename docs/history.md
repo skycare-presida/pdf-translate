@@ -218,3 +218,17 @@ DeepL does not cover must not turn into a failed job when the previous
 engine could have translated the document. Every fallback is named on
 the PDF's provenance line so the reader knows which engine produced the
 text in front of them.
+
+## Local OCR fallback for runaway pages (Nov 2026)
+
+A clean five-page scan failed after eight minutes: the vision model ran to
+the 16,384-token cap on pages 1-2, the batch was split, and page 1 alone
+(152 readable words) ran to the cap again, which was fatal. The existing
+fabrication guard never fired because the truncation check comes first, and
+the Tesseract fallback only covered Cyrillic.
+
+A single page that overflows or times out is now read with Tesseract,
+whatever the script, and OCR calls are budgeted per page so the overflow
+shows up sooner. A page with no words at all gets a marker rather than
+failing the document — a photo page in the middle of a discharge letter
+should not cost the reader the other four pages.
