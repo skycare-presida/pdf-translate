@@ -56,6 +56,7 @@ def env(monkeypatch):
     monkeypatch.setattr(svc, "preprocess_image_bytes", lambda b, label="": b)
     monkeypatch.setattr(svc, "_tesseract_installed", {"eng", "spa", "ukr", "osd"})
     monkeypatch.setattr(svc, "TRANSLATE_ENGINE", "llm")          # translation is stubbed
+    monkeypatch.setattr(svc, "MODEL_OCR", svc.MODEL_MISTRAL)     # one OCR model unless a test says otherwise
     monkeypatch.setattr(svc, "translate_text_with_model",
                         lambda text, tl, model: "EN: " + text[:40])
     monkeypatch.setattr(svc, "_looks_untranslated", lambda *a, **k: False)
@@ -211,3 +212,45 @@ def test_normal_page_streams_through_and_blocking_mode_still_works(monkeypatch):
     monkeypatch.setattr(svc, "OCR_STREAMING", False)
     text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
     assert text == PAGE and assessment["language"] == "Spanish"
+
+
+GOOD = PAGE + '\n```json\n{"language":"Spanish","script":"Latin","confidence":0.9}\n```'
+
+
+def _by_model(monkeypatch, answers):
+    """Vision stub that answers per model name and records which models were asked."""
+    asked = []
+
+    def create(**kw):
+        asked.append((kw["model"], kw["max_tokens"]))
+        result = answers[kw["model"]]
+        if isinstance(result, Exception):
+            raise result
+        return _as_stream(result) if kw.get("stream") else result
+
+    monkeypatch.setattr(svc, "ovh_client", SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    return asked
+
+
+def test_stronger_ocr_model_is_asked_first_and_named(monkeypatch):
+    monkeypatch.setattr(svc, "MODEL_OCR", "Big-Vision")
+    asked = _by_model(monkeypatch, {"Big-Vision": _response("<think>hmm</think>\n" + GOOD)})
+    text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
+    assert [m for m, _ in asked] == ["Big-Vision"]
+    assert asked[0][1] == svc.OCR_TOKENS_PER_PAGE + 600 + svc.OCR_REASONING_HEADROOM
+    assert "Informe de alta" in text and "<think>" not in text
+    assert assessment["ocr_model"] == "Big-Vision" and assessment["language"] == "Spanish"
+
+
+@pytest.mark.parametrize("failure", [
+    RuntimeError("model not found"),
+    _response("z" * 500, finish="length"),
+    _response(""),
+])
+def test_stronger_ocr_model_failure_falls_back_to_mistral(monkeypatch, failure):
+    monkeypatch.setattr(svc, "MODEL_OCR", "Big-Vision")
+    asked = _by_model(monkeypatch, {"Big-Vision": failure, svc.MODEL_MISTRAL: _response(GOOD)})
+    text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
+    assert [m for m, _ in asked] == ["Big-Vision", svc.MODEL_MISTRAL]
+    assert "Informe de alta" in text and assessment["ocr_model"] == svc.MODEL_MISTRAL
