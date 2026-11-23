@@ -147,6 +147,15 @@ budgeted at 6,000 output tokens per page, so a runaway page is caught in
 about a third of the time it used to take. The cover line names any pages
 read by local OCR.
 
+**A stronger model reads scans first.** Scans and photographs are read by
+`Qwen3.5-397B-A17B`, a larger vision model on OVHcloud AI Endpoints, because
+Mistral-Small gives up on poor images a person can still read. If that model
+errors, times out, loops or returns nothing, the same pages go to
+Mistral-Small as before, and then to local OCR. `OCR_MODEL` in `.env` picks
+another OVHcloud vision model; `OCR_MODEL=Mistral-Small-3.2-24B-Instruct-2506`
+restores the previous behaviour. The cover line and `/health` name the model
+that did the reading.
+
 **Runaway OCR is abandoned as it happens.** The OCR response is streamed and
 checked every 1,500 characters. If the model starts looping on one line, or
 produces more text than the pages can hold, the call is dropped at once and

@@ -119,6 +119,17 @@ from reportlab.platypus import (
 OVHCLOUD_BASE_URL  = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 MODEL_MISTRAL      = "Mistral-Small-3.2-24B-Instruct-2506"
 MODEL_LLAMA        = "Meta-Llama-3_3-70B-Instruct"
+# The model that reads scans and photographs (Stage 1). Mistral-Small is quick
+# and cheap but gives up on poor images that a person can still read, so the
+# reading goes to a larger vision model first and Mistral-Small is kept as the
+# fallback if that model errors, times out or runs away. OCR_MODEL in .env picks
+# any vision model on OVHcloud AI Endpoints; set it to the Mistral name above
+# to go back to the old behaviour.
+MODEL_OCR          = (os.environ.get("OCR_MODEL", "").strip()
+                      or "Qwen3.5-397B-A17B")
+# Larger models think before they answer, and the thinking counts against the
+# output cap, so they get this many extra tokens per request.
+OCR_REASONING_HEADROOM = int(os.environ.get("OCR_REASONING_HEADROOM", "6000"))
 
 RENDER_DPI           = 150
 SKEW_THRESHOLD_DEG   = 3.0
@@ -1352,7 +1363,8 @@ def ocr_with_tesseract(b64_images: list[str], page_label: str = "",
     return result
 
 
-def _ocr_call(content: list, budget: int, n_images: int, page_label: str = "") -> str:
+def _ocr_call(content: list, budget: int, n_images: int, page_label: str = "",
+              model: str = "") -> str:
     """
     One vision-OCR request, returning the raw response text.
 
@@ -1366,7 +1378,8 @@ def _ocr_call(content: list, budget: int, n_images: int, page_label: str = "") -
     the caller splits the batch or reads the page locally.
     """
     where = f" ({page_label})" if page_label else ""
-    request = dict(model=MODEL_MISTRAL, messages=[{"role": "user", "content": content}],
+    request = dict(model=model or MODEL_MISTRAL,
+                   messages=[{"role": "user", "content": content}],
                    max_tokens=budget, temperature=0.1, timeout=OCR_TIMEOUT_SECONDS)
 
     if not OCR_STREAMING:
@@ -1520,11 +1533,33 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
         "type": "text",
         "text": hint + OCR_ASSESSMENT_PROMPT,
     })
-    log.info("Stage 1: OCR + assessment via %s (%d images%s)",
-             MODEL_MISTRAL, len(b64_images), f", {page_label}" if page_label else "")
     budget = min(MAX_OUTPUT_TOKENS, OCR_TOKENS_PER_PAGE * len(b64_images) + 600)
+    where = f", {page_label}" if page_label else ""
+    ocr_model, raw = MODEL_MISTRAL, None
+    if MODEL_OCR != MODEL_MISTRAL:
+        # Stronger reader first. Whatever goes wrong with it — an error, a
+        # timeout, a loop, the output cap — the page goes to Mistral-Small
+        # exactly as it did before this model was added.
+        log.info("Stage 1: OCR + assessment via %s (%d images%s)",
+                 MODEL_OCR, len(b64_images), where)
+        try:
+            raw = _ocr_call(content, budget + OCR_REASONING_HEADROOM,
+                            len(b64_images), page_label, model=MODEL_OCR)
+            # Some reasoning models leave their thinking in the answer.
+            raw = re.sub(r"(?s)^\s*<think>.*?</think>\s*", "", raw or "")
+            if not raw:
+                raise TranslationTruncated("empty answer")
+            ocr_model = MODEL_OCR
+        except Exception as e:
+            raw = None
+            log.warning("Stage 1: %s could not read %s (%s: %s) — trying %s",
+                        MODEL_OCR, page_label or "the page(s)",
+                        type(e).__name__, str(e)[:200], MODEL_MISTRAL)
     try:
-        raw = _ocr_call(content, budget, len(b64_images), page_label)
+        if raw is None:
+            log.info("Stage 1: OCR + assessment via %s (%d images%s)",
+                     MODEL_MISTRAL, len(b64_images), where)
+            raw = _ocr_call(content, budget, len(b64_images), page_label)
     except (TranslationTruncated, APITimeoutError) as e:
         # Several pages: let the caller halve the batch and try again. A single
         # page that still runs away is one the vision model cannot read — it
@@ -1539,6 +1574,7 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
         return _local_ocr_fallback(b64_images, {}, page_label)
 
     extracted_text, assessment = _parse_assessment(raw)
+    assessment["ocr_model"] = ocr_model
 
     # Poor-scan guard: implausibly long output means the model is fabricating,
     # not reading. Try Tesseract for Cyrillic before failing.
@@ -2573,7 +2609,7 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
 
     # Build model provenance string from assessment
     if assessment:
-        ocr_model  = MODEL_MISTRAL
+        ocr_model  = assessment.get("ocr_model", MODEL_MISTRAL)
         tx_model   = assessment.get("translation_model", MODEL_MISTRAL)
         language   = assessment.get("language", "unknown")
         confidence = assessment.get("confidence", 0)
@@ -3180,7 +3216,8 @@ def health():
     counts = {r["status"]: r["n"] for r in rows}
     return jsonify({
         "status":               "ok",
-        "ocr_model":            MODEL_MISTRAL,
+        "ocr_model":            MODEL_OCR,
+        "ocr_fallback_model":   MODEL_MISTRAL,
         "translation_engine":   DEEPL_ENGINE_NAME if deepl_client else "ovhcloud-models",
         "deepl": {
             "enabled":  deepl_client is not None,
@@ -3395,7 +3432,7 @@ def translate_sync():
 
 if __name__ == "__main__":
     log.info("SkyCare PDF Translation Service v3 | port=%d", PORT)
-    log.info("OCR model: %s", MODEL_MISTRAL)
+    log.info("OCR model: %s (fallback %s)", MODEL_OCR, MODEL_MISTRAL)
     log.info("Translation models: %s / %s", MODEL_MISTRAL, MODEL_LLAMA)
     log.info("Job DB: %s | Job TTL: %ds | Workers: %d", DB_PATH, JOB_TTL_SECS, MAX_WORKERS)
     app.run(host="0.0.0.0", port=PORT, debug=False)
