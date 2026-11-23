@@ -47,6 +47,13 @@ TESSERACT_PKGS=(
     tesseract-ocr
     tesseract-ocr-ukr tesseract-ocr-rus tesseract-ocr-bul
     tesseract-ocr-srp tesseract-ocr-mkd tesseract-ocr-bel tesseract-ocr-kaz
+    # Local OCR fallback for any page the vision model cannot read (Nov 2026):
+    # script detection plus the common Latin, Greek, Arabic and Hebrew packs.
+    tesseract-ocr-osd
+    tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-spa tesseract-ocr-ita
+    tesseract-ocr-por tesseract-ocr-nld tesseract-ocr-pol tesseract-ocr-tur
+    tesseract-ocr-ces tesseract-ocr-ron tesseract-ocr-hun
+    tesseract-ocr-ell tesseract-ocr-ara tesseract-ocr-fas tesseract-ocr-heb
 )
 MISSING_PKGS=()
 for pkg in "${TESSERACT_PKGS[@]}"; do
@@ -56,7 +63,7 @@ if (( ${#MISSING_PKGS[@]} > 0 )); then
     info "Installing: ${MISSING_PKGS[*]}"
     apt-get update -qq
     apt-get install -y -qq "${MISSING_PKGS[@]}"
-    success "Tesseract and Cyrillic language packs installed."
+    success "Tesseract and language packs installed."
 else
     success "Tesseract and language packs already installed."
 fi

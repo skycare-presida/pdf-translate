@@ -93,7 +93,7 @@ from pathlib import Path
 import pymupdf as fitz
 import pdfplumber
 from flask import Flask, jsonify, request, send_file
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 try:                      # DeepL is the primary translation engine, but the
     import deepl          # service must still start (and fall back to the
@@ -137,6 +137,20 @@ MAX_CHARS_PER_CHUNK  = 60_000   # Mode A block batching (input-side only)
 #   fabricating, so we treat it as an unreadable scan and fail with a reason.
 OCR_TIMEOUT_SECONDS    = 300      # 5 min hard cap per OCR call (was silently 600)
 MAX_OCR_CHARS_PER_PAGE = 8_000    # above this per page = pathological OCR
+# Output budget for an OCR call. A real page fits well inside 6,000 tokens (the
+# 8,000-character ceiling above is 2-4k tokens in most scripts). Capping the
+# call here rather than at MAX_OUTPUT_TOKENS means a page that sends the model
+# rambling is caught in about a third of the time (Nov 2026: a readable
+# 152-word page took 3.5 minutes to run to 34k characters, twice over).
+OCR_TOKENS_PER_PAGE    = 6_000
+# Local OCR fallback: a page with fewer readable words than this, after the
+# vision model has already failed on it, is treated as holding no printed text
+# (a photo, an image, a blank) and gets a visible marker instead of failing
+# the whole document.
+MIN_FALLBACK_WORDS     = 5
+NO_TEXT_MARKER = ("[NO MACHINE-READABLE TEXT WAS FOUND ON THIS PAGE. If the original "
+                  "page holds handwriting, an image or text, it has NOT been "
+                  "translated - see the original page.]")
 
 # --- Output-token budgeting -------------------------------------------------
 # The failure mode we are guarding against is SILENT TRUNCATION: the model hits
@@ -317,7 +331,8 @@ def _looks_repetitive(text: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _check_not_truncated(response, stage: str, job_context: str = "") -> None:
+def _check_not_truncated(response, stage: str, job_context: str = "",
+                         limit: int = 0) -> None:
     """
     Inspect an OpenAI-compatible response for finish_reason == "length".
 
@@ -355,7 +370,7 @@ def _check_not_truncated(response, stage: str, job_context: str = "") -> None:
                "read the image clearly rather than the page being unusually long"
                ) if repetitive else ""
         raise TranslationTruncated(
-            f"{stage} output was truncated at the {MAX_OUTPUT_TOKENS}-token "
+            f"{stage} output was truncated at the {limit or MAX_OUTPUT_TOKENS}-token "
             f"limit{where}{why}. This job has been failed rather than returning "
             "an incomplete translation."
         )
@@ -1137,14 +1152,48 @@ def _should_escalate(assessment: dict) -> tuple[bool, str]:
 
 TESSERACT_LANGS = "ukr+rus+bul+srp+mkd+bel+kaz+eng"  # Cyrillic-script + English
 
+# Language packs to try per script, most likely first. Only installed packs are
+# used (install.sh installs these), and English is always available.
+TESSERACT_LANGS_BY_SCRIPT = {
+    "cyrillic": ["ukr", "rus", "bul", "srp", "mkd", "bel", "kaz", "eng"],
+    "latin":    ["eng", "fra", "deu", "spa", "ita", "por", "nld", "pol", "tur",
+                 "ces", "ron", "hun"],
+    "greek":    ["ell", "eng"],
+    "arabic":   ["ara", "fas", "eng"],
+    "hebrew":   ["heb", "eng"],
+}
+_tesseract_installed: set[str] | None = None
+
+
+def _tesseract_langs_installed() -> set[str]:
+    """Installed Tesseract language packs (empty if Tesseract is missing)."""
+    global _tesseract_installed
+    if _tesseract_installed is None:
+        try:
+            out = subprocess.run(["tesseract", "--list-langs"],
+                                 capture_output=True, text=True, timeout=10)
+            _tesseract_installed = {l.strip() for l in out.stdout.splitlines()[1:] if l.strip()}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            _tesseract_installed = set()
+    return _tesseract_installed
+
+
 def _tesseract_available() -> bool:
     """True if the tesseract binary and at least the Ukrainian pack are present."""
+    return "ukr" in _tesseract_langs_installed()
+
+
+def _detect_script(image_path: str) -> str:
+    """Script of a page via Tesseract's orientation/script detection, or ""."""
+    if "osd" not in _tesseract_langs_installed():
+        return ""
     try:
-        langs = subprocess.run(["tesseract", "--list-langs"],
-                               capture_output=True, text=True, timeout=10)
-        return "ukr" in langs.stdout
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return False
+        out = subprocess.run(["tesseract", image_path, "stdout", "--psm", "0"],
+                             capture_output=True, text=True, timeout=60)
+        m = re.search(r"Script:\s*(\w+)", out.stdout)
+        return m.group(1).lower() if m else ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
 
 
 # --- Scan preprocessing (OpenCV) --------------------------------------------
@@ -1251,7 +1300,8 @@ def preprocess_image_bytes(img_bytes: bytes, page_label: str = "") -> bytes:
         return img_bytes
 
 
-def ocr_with_tesseract(b64_images: list[str], page_label: str = "") -> str:
+def ocr_with_tesseract(b64_images: list[str], page_label: str = "",
+                       script: str = "cyrillic") -> str:
     """
     Deterministic local OCR via Tesseract, for Cyrillic-script scans that the
     vision model mangles. Returns extracted text (no assessment — the caller
@@ -1270,8 +1320,12 @@ def ocr_with_tesseract(b64_images: list[str], page_label: str = "") -> str:
             tf.write(img_bytes)
             tmp_path = tf.name
         try:
+            page_script = script or _detect_script(tmp_path) or "latin"
+            wanted = TESSERACT_LANGS_BY_SCRIPT.get(page_script,
+                                                   TESSERACT_LANGS_BY_SCRIPT["latin"])
+            langs = [l for l in wanted if l in _tesseract_langs_installed()] or ["eng"]
             proc = subprocess.run(
-                ["tesseract", tmp_path, "stdout", "-l", TESSERACT_LANGS, "--psm", "3"],
+                ["tesseract", tmp_path, "stdout", "-l", "+".join(langs), "--psm", "3"],
                 capture_output=True, text=True, timeout=OCR_TIMEOUT_SECONDS,
             )
             texts.append(proc.stdout)
@@ -1284,6 +1338,67 @@ def ocr_with_tesseract(b64_images: list[str], page_label: str = "") -> str:
     log.info("Tesseract OCR%s: %d char(s) from %d page(s)",
              f" ({page_label})" if page_label else "", len(result), len(b64_images))
     return result
+
+
+def _unreadable(page_label: str) -> UnreadableScan:
+    return UnreadableScan(
+        f"The document could not be read reliably by OCR"
+        f"{' (' + page_label + ')' if page_label else ''}. This usually means "
+        "the scan quality is too low — the text is blurred, skewed, low-"
+        "contrast or creased. A clearer scan, or manual translation, is "
+        "needed. (No translation has been produced, to avoid returning "
+        "fabricated content.)"
+    )
+
+
+def _local_ocr_fallback(b64_images: list[str], assessment: dict,
+                        page_label: str = "") -> tuple[str, dict]:
+    """
+    Read pages with Tesseract after the vision model over-produced on them.
+
+    Tesseract returns what is on the page and cannot fabricate, so its text is
+    safe to translate. Per page:
+      - plausible text            -> used;
+      - almost no words           -> NO_TEXT_MARKER (a photo, image or blank
+                                     page must not fail a whole document, and
+                                     the marker tells the reader to look at
+                                     the original);
+      - implausibly long          -> UnreadableScan, as before.
+    The assessment is marked ocr_engine="tesseract"; where the vision model
+    gave no language the language is "unknown" (DeepL auto-detects; the
+    fallback models escalate on the zero confidence).
+    """
+    if not _tesseract_langs_installed():
+        raise _unreadable(page_label)
+
+    script = str(assessment.get("script", "")).lower()
+    language = str(assessment.get("language", "")).lower()
+    if "cyrillic" in script or language in ("ukrainian", "russian", "bulgarian", "serbian",
+                                            "macedonian", "belarusian", "kazakh"):
+        script = "cyrillic"
+    elif script not in TESSERACT_LANGS_BY_SCRIPT:
+        script = ""                       # let Tesseract detect it per page
+
+    texts, no_text = [], 0
+    for img in b64_images:
+        text = ocr_with_tesseract([img], page_label, script).strip()
+        if len(re.findall(r"\w{2,}", text)) < MIN_FALLBACK_WORDS:
+            text, no_text = NO_TEXT_MARKER, no_text + 1
+        elif len(text) > MAX_OCR_CHARS_PER_PAGE:
+            log.warning("Local OCR also over-produced%s",
+                        f" ({page_label})" if page_label else "")
+            raise _unreadable(page_label)
+        texts.append(text)
+
+    if not assessment.get("language"):
+        assessment.update({"language": "unknown", "script": script or "unknown",
+                           "confidence": 0.0, "escalate": True,
+                           "reason": "Local OCR fallback — language not assessed"})
+    assessment["ocr_engine"] = "tesseract"
+    assessment["no_text_pages"] = no_text
+    log.info("Local OCR fallback%s: %d page(s), %d with no readable text",
+             f" ({page_label})" if page_label else "", len(b64_images), no_text)
+    return "\n\n---PAGE BREAK---\n\n".join(texts), assessment
 
 
 def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
@@ -1330,14 +1445,28 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
     })
     log.info("Stage 1: OCR + assessment via %s (%d images%s)",
              MODEL_MISTRAL, len(b64_images), f", {page_label}" if page_label else "")
-    response = ovh_client.chat.completions.create(
-        model=MODEL_MISTRAL,
-        messages=[{"role": "user", "content": content}],
-        max_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0.1,
-        timeout=OCR_TIMEOUT_SECONDS,
-    )
-    _check_not_truncated(response, "OCR", page_label)
+    budget = min(MAX_OUTPUT_TOKENS, OCR_TOKENS_PER_PAGE * len(b64_images) + 600)
+    try:
+        response = ovh_client.chat.completions.create(
+            model=MODEL_MISTRAL,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=budget,
+            temperature=0.1,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+        _check_not_truncated(response, "OCR", page_label, budget)
+    except (TranslationTruncated, APITimeoutError) as e:
+        # Several pages: let the caller halve the batch and try again. A single
+        # page that still runs away is one the vision model cannot read — it
+        # is rambling, not transcribing — so read that page locally instead of
+        # failing the whole document.
+        if len(b64_images) > 1:
+            if isinstance(e, APITimeoutError):
+                raise TranslationTruncated(f"OCR timed out ({page_label})") from e
+            raise
+        log.warning("Vision OCR could not read %s (%s) — trying local OCR",
+                    page_label or "page", type(e).__name__)
+        return _local_ocr_fallback(b64_images, {}, page_label)
 
     raw = response.choices[0].message.content.strip()
     extracted_text, assessment = _parse_assessment(raw)
@@ -1350,29 +1479,7 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
                     "poor scan provoking fabricated output%s",
                     len(extracted_text), len(b64_images), ceiling,
                     f" ({page_label})" if page_label else "")
-        script = str(assessment.get("script", "")).lower()
-        language = str(assessment.get("language", "")).lower()
-        cyrillic = "cyrillic" in script or language in (
-            "ukrainian", "russian", "bulgarian", "serbian", "macedonian",
-            "belarusian", "kazakh")
-        if cyrillic and _tesseract_available():
-            log.info("Falling back to Tesseract for Cyrillic scan%s",
-                     f" ({page_label})" if page_label else "")
-            t_text = ocr_with_tesseract(b64_images, page_label)
-            if t_text.strip() and len(t_text) <= ceiling:
-                # Keep Mistral's language assessment; use Tesseract's text.
-                assessment["ocr_engine"] = "tesseract"
-                return t_text, assessment
-            log.warning("Tesseract fallback did not yield usable text%s",
-                        f" ({page_label})" if page_label else "")
-        raise UnreadableScan(
-            f"The document could not be read reliably by OCR"
-            f"{' (' + page_label + ')' if page_label else ''}. This usually means "
-            "the scan quality is too low — the text is blurred, skewed, low-"
-            "contrast or creased. A clearer scan, or manual translation, is "
-            "needed. (No translation has been produced, to avoid returning "
-            "fabricated content.)"
-        )
+        return _local_ocr_fallback(b64_images, assessment, page_label)
 
     log.info("Stage 1: extracted %d chars | language=%s confidence=%.2f escalate=%s",
              len(extracted_text), assessment.get("language"),
@@ -1742,6 +1849,13 @@ def _provenance_notes(assessment: dict) -> str:
         notes += f" (escalated — {assessment['escalation_reason']})"
     if assessment.get("deepl_fallback_reason"):
         notes += f" | DeepL not used: {assessment['deepl_fallback_reason']}"
+    if assessment.get("local_ocr_pages"):
+        notes += (" | Local OCR (Tesseract) used for "
+                  + ", ".join(assessment["local_ocr_pages"])
+                  + " — the vision model could not read it reliably")
+    if assessment.get("no_text_pages"):
+        notes += (f" | {assessment['no_text_pages']} PAGE(S) HAD NO MACHINE-READABLE "
+                  "TEXT AND ARE NOT TRANSLATED — CHECK THE ORIGINAL")
     return notes
 
 
@@ -1961,7 +2075,14 @@ def ocr_batch_adaptive(b64_images: list[str], source_hint: str,
 
         # Keep the first usable language assessment — the source language does
         # not change halfway through a document.
-        assessment = assess_a if assess_a.get("language") else assess_b
+        def known(a: dict) -> bool:
+            return str(a.get("language") or "unknown").lower() != "unknown"
+        assessment = dict(assess_a if known(assess_a) or not known(assess_b) else assess_b)
+        # Local-OCR facts belong to the whole batch, whichever half they came from.
+        if "tesseract" in (assess_a.get("ocr_engine"), assess_b.get("ocr_engine")):
+            assessment["ocr_engine"] = "tesseract"
+        assessment["no_text_pages"] = (assess_a.get("no_text_pages", 0)
+                                       + assess_b.get("no_text_pages", 0))
         return f"{text_a}\n\n---PAGE BREAK---\n\n{text_b}", assessment
 
 
@@ -1978,6 +2099,10 @@ def translate_images(b64_images: list[str], target_lang: str, source_hint: str,
     extracted_text, assessment = ocr_batch_adaptive(
         b64_images, source_hint, first_page
     )
+
+    # A batch that is nothing but no-text markers has nothing to translate.
+    if not extracted_text.replace(NO_TEXT_MARKER, "").replace("---PAGE BREAK---", "").strip():
+        return extracted_text, assessment, False, extracted_text
 
     # Determine translation model
     if model_override == "llama":
@@ -2204,6 +2329,8 @@ def translate_all_images(b64_images: list[str], target_lang: str, source_hint: s
     final_assessment: dict = {}
     was_escalated = False
     engines: list[str] = []          # translation engine used for each batch
+    local_ocr_pages: list[str] = []  # batches read by Tesseract, not the vision model
+    no_text_pages = 0
     fallback_reason = ""
 
     log.info("translate_all_images: %d page(s) in %d batch(es) of up to %d",
@@ -2230,12 +2357,26 @@ def translate_all_images(b64_images: list[str], target_lang: str, source_hint: s
         if not final_assessment:
             final_assessment = assessment   # First batch's language assessment
         engines.append(assessment.get("translation_model", ""))
+        if assessment.get("ocr_engine") == "tesseract":
+            local_ocr_pages.append(page_label)
+        no_text_pages += assessment.get("no_text_pages", 0)
+        # The first batch may have had no language assessment (local OCR).
+        if (str(final_assessment.get("language", "unknown")).lower() == "unknown"
+                and str(assessment.get("language", "unknown")).lower() != "unknown"):
+            for key in ("language", "script", "confidence"):
+                if key in assessment:
+                    final_assessment[key] = assessment[key]
         if assessment.get("deepl_fallback_reason"):
             fallback_reason = assessment["deepl_fallback_reason"]
         was_escalated = was_escalated or escalated
         all_text_parts.extend(
             part for part in text.split("---PAGE BREAK---") if part.strip()
         )
+
+    if no_text_pages >= total_pages:
+        raise _unreadable("")            # nothing readable anywhere in the document
+    final_assessment["local_ocr_pages"] = local_ocr_pages
+    final_assessment["no_text_pages"] = no_text_pages
 
     # Provenance must describe the whole document, not just the first batch:
     # DeepL may have failed part-way and handed later batches to the models.
