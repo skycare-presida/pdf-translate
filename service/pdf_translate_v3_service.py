@@ -143,6 +143,11 @@ MAX_OCR_CHARS_PER_PAGE = 8_000    # above this per page = pathological OCR
 # rambling is caught in about a third of the time (Nov 2026: a readable
 # 152-word page took 3.5 minutes to run to 34k characters, twice over).
 OCR_TOKENS_PER_PAGE    = 6_000
+# Watch the OCR response as it streams and abandon it as soon as it loops or
+# outgrows the page, instead of waiting minutes for it to reach the cap.
+# OCR_STREAMING=off restores the single blocking call.
+OCR_STREAMING          = os.environ.get("OCR_STREAMING", "on").strip().lower() != "off"
+OCR_STREAM_CHECK_CHARS = 1_500    # re-check the output every this many characters
 # Local OCR fallback: a page with fewer readable words than this, after the
 # vision model has already failed on it, is treated as holding no printed text
 # (a photo, an image, a blank) and gets a visible marker instead of failing
@@ -688,6 +693,9 @@ OCR_ASSESSMENT_PROMPT = """You are performing two tasks on the document image(s)
 
 TASK 1 — TEXT EXTRACTION
 Extract all text exactly as it appears on the page(s). Preserve layout, headings, and structure.
+Keep every bullet point, numbered item, list entry and table row on its OWN line, with its
+bullet or number. Never merge list items, or separate lines of a form, into a paragraph.
+Keep a blank line between paragraphs and between sections.
 Mark handwritten text as {handwritten: text}. Mark illegible text as [ILLEGIBLE].
 Separate pages with a line containing only '---PAGE BREAK---'.
 Do NOT add any headers, labels, or commentary of your own — output only the document text.
@@ -1161,6 +1169,7 @@ TESSERACT_LANGS_BY_SCRIPT = {
     "greek":    ["ell", "eng"],
     "arabic":   ["ara", "fas", "eng"],
     "hebrew":   ["heb", "eng"],
+    "undetected": ["eng", "spa", "fra", "deu", "ita", "por", "ukr", "rus"],
 }
 _tesseract_installed: set[str] | None = None
 
@@ -1320,9 +1329,12 @@ def ocr_with_tesseract(b64_images: list[str], page_label: str = "",
             tf.write(img_bytes)
             tmp_path = tf.name
         try:
-            page_script = script or _detect_script(tmp_path) or "latin"
+            # No hint and no detection (script pack missing, or a page too
+            # sparse to judge): try Latin and Cyrillic together rather than
+            # guess one and read the other as garbage.
+            page_script = script or _detect_script(tmp_path) or "undetected"
             wanted = TESSERACT_LANGS_BY_SCRIPT.get(page_script,
-                                                   TESSERACT_LANGS_BY_SCRIPT["latin"])
+                                                   TESSERACT_LANGS_BY_SCRIPT["undetected"])
             langs = [l for l in wanted if l in _tesseract_langs_installed()] or ["eng"]
             proc = subprocess.run(
                 ["tesseract", tmp_path, "stdout", "-l", "+".join(langs), "--psm", "3"],
@@ -1338,6 +1350,71 @@ def ocr_with_tesseract(b64_images: list[str], page_label: str = "",
     log.info("Tesseract OCR%s: %d char(s) from %d page(s)",
              f" ({page_label})" if page_label else "", len(result), len(b64_images))
     return result
+
+
+def _ocr_call(content: list, budget: int, n_images: int, page_label: str = "") -> str:
+    """
+    One vision-OCR request, returning the raw response text.
+
+    The response is streamed and watched as it arrives. A model that cannot
+    read a page does not stop — it loops on one line, or rambles, until the
+    output cap, which used to cost 2-5 minutes per attempt before anything
+    could react (Nov 2026: a five-page scan took 16 minutes, 15 of them
+    waiting for four runaway calls to finish). Watching the stream lets the
+    call be abandoned seconds after the loop starts. Raises TranslationTruncated
+    for a loop, an implausibly long output, the output cap, or the time limit;
+    the caller splits the batch or reads the page locally.
+    """
+    where = f" ({page_label})" if page_label else ""
+    request = dict(model=MODEL_MISTRAL, messages=[{"role": "user", "content": content}],
+                   max_tokens=budget, temperature=0.1, timeout=OCR_TIMEOUT_SECONDS)
+
+    if not OCR_STREAMING:
+        response = ovh_client.chat.completions.create(**request)
+        _check_not_truncated(response, "OCR", page_label, budget)
+        return response.choices[0].message.content.strip()
+
+    # Room above the per-page ceiling for the language-assessment JSON.
+    max_chars = MAX_OCR_CHARS_PER_PAGE * max(1, n_images) + 1_000
+    deadline = time.time() + OCR_TIMEOUT_SECONDS
+    parts: list[str] = []
+    size, next_check, finish = 0, OCR_STREAM_CHECK_CHARS, None
+
+    stream = ovh_client.chat.completions.create(stream=True, **request)
+    try:
+        for chunk in stream:
+            if not getattr(chunk, "choices", None):
+                continue
+            choice = chunk.choices[0]
+            piece = getattr(choice.delta, "content", None) or ""
+            parts.append(piece)
+            size += len(piece)
+            finish = choice.finish_reason or finish
+
+            if time.time() > deadline:
+                raise TranslationTruncated(f"OCR exceeded {OCR_TIMEOUT_SECONDS}s{where}")
+            if size < next_check:
+                continue
+            next_check = size + OCR_STREAM_CHECK_CHARS
+            repetitive, why = _looks_repetitive("".join(parts))
+            if repetitive:
+                log.warning("OCR abandoned after %d chars%s — the model is looping (%s)",
+                            size, where, why)
+                raise TranslationTruncated(f"OCR output was repetitive{where}: {why}")
+            if size > max_chars:
+                log.warning("OCR abandoned after %d chars%s — more than a page can hold",
+                            size, where)
+                raise TranslationTruncated(
+                    f"OCR produced more text than {n_images} page(s) can hold{where}")
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            close()                 # stop the model generating once we stop reading
+
+    if finish == "length":
+        raise TranslationTruncated(
+            f"OCR output was truncated at the {budget}-token limit{where}.")
+    return "".join(parts).strip()
 
 
 def _unreadable(page_label: str) -> UnreadableScan:
@@ -1447,14 +1524,7 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
              MODEL_MISTRAL, len(b64_images), f", {page_label}" if page_label else "")
     budget = min(MAX_OUTPUT_TOKENS, OCR_TOKENS_PER_PAGE * len(b64_images) + 600)
     try:
-        response = ovh_client.chat.completions.create(
-            model=MODEL_MISTRAL,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=budget,
-            temperature=0.1,
-            timeout=OCR_TIMEOUT_SECONDS,
-        )
-        _check_not_truncated(response, "OCR", page_label, budget)
+        raw = _ocr_call(content, budget, len(b64_images), page_label)
     except (TranslationTruncated, APITimeoutError) as e:
         # Several pages: let the caller halve the batch and try again. A single
         # page that still runs away is one the vision model cannot read — it
@@ -1468,7 +1538,6 @@ def ocr_images_with_assessment(b64_images: list[str], source_hint: str,
                     page_label or "page", type(e).__name__)
         return _local_ocr_fallback(b64_images, {}, page_label)
 
-    raw = response.choices[0].message.content.strip()
     extracted_text, assessment = _parse_assessment(raw)
 
     # Poor-scan guard: implausibly long output means the model is fabricating,
@@ -1592,7 +1661,8 @@ class DeepLUnavailable(RuntimeError):
 _deepl_skip_until = 0.0            # cooldown after an outage / auth / quota failure
 _deepl_source_names: list[str] | None = None
 _MARKER_RE = re.compile(r"\[(?:ILLEGIBLE|UNCLEAR)\]", re.IGNORECASE)
-_LIST_START_RE = re.compile(r"^\s*([\-•·\*–—]|\(?\w{1,3}[.)]\s|\d+[.):]?\s)")
+_LIST_START_RE = re.compile(
+    r"^\s*([\-•·\*–—▪■●○◦‣➢✓©¢»>]|\(?\w{1,3}[.)]\s|\d+[.):]?\s)")
 
 
 def _deepl_target_code(target_lang: str) -> str | None:
@@ -1630,10 +1700,20 @@ def _unwrap_soft_breaks(text: str) -> str:
 
     DeepL treats every newline as a sentence boundary (which is what keeps
     lists and table rows on their own lines), so a paragraph wrapped at the
-    page margin would otherwise be translated as disconnected fragments. A
-    line is joined to the next only when it is prose-length for its paragraph,
-    does not end a sentence, and the next line does not start a list item —
-    short lines (headings, list items, table cells, lab rows) are left alone.
+    page margin would otherwise be translated as disconnected fragments.
+
+    Joining is deliberately timid, because the opposite mistake — running a
+    list of medications or diagnoses together into one paragraph — destroys
+    structure the reader relies on. A line is joined to the next only when
+    ALL of these hold:
+      - it is prose-length for its paragraph (it reached the right margin);
+      - it does not end a sentence;
+      - the next line does not start with a bullet or a number; and
+      - the next line visibly continues the sentence: it starts with a
+        lower-case letter, or the line before ends in a comma or a hyphen.
+    List items start with a capital, a bullet or a number, so they stay one per
+    line. The cost is that a wrapped sentence whose next line happens to start
+    with a capital (common in German) is translated in two pieces.
     """
     out_paras = []
     for para in text.split("\n\n"):
@@ -1646,7 +1726,9 @@ def _unwrap_soft_breaks(text: str) -> str:
             if (prev and line.strip()
                     and len(prev) >= min_len
                     and not prev.rstrip().endswith((".", ":", ";", "!", "?", "。"))
-                    and not _LIST_START_RE.match(line)):
+                    and not _LIST_START_RE.match(line)
+                    and (line.lstrip()[:1].islower()
+                         or prev.rstrip().endswith((",", "-")))):
                 if prev.endswith("-") and prev[-2:-1].isalpha() and line[:1].islower():
                     joined[-1] = prev[:-1] + line.lstrip()      # de-hyphenate
                 else:
@@ -2115,11 +2197,6 @@ def translate_images(b64_images: list[str], target_lang: str, source_hint: str,
     source_language = assessment.get("language", "unknown")
     tx_model = MODEL_LLAMA if escalate else MODEL_MISTRAL
 
-    if escalate:
-        log.info("Stage 2: escalating to %s — %s", MODEL_LLAMA, reason)
-    else:
-        log.info("Stage 2: translating with %s (no escalation needed)", MODEL_MISTRAL)
-
     assessment["translation_model"] = tx_model
     if escalate:
         assessment["escalation_reason"] = reason
@@ -2127,7 +2204,15 @@ def translate_images(b64_images: list[str], target_lang: str, source_hint: str,
     # DeepL first; the model path below is the fallback.
     translation = try_deepl(extracted_text, target_lang, assessment, model_override)
     if translation is not None:
+        log.info("Stage 2: translated by DeepL")
         return translation, assessment, False, extracted_text
+
+    # Only now is a model actually going to translate — say which and why.
+    if escalate:
+        log.info("Stage 2: DeepL not used — translating with %s (escalated: %s)",
+                 MODEL_LLAMA, reason)
+    else:
+        log.info("Stage 2: DeepL not used — translating with %s", MODEL_MISTRAL)
 
     # Attempt translation — retry once with Llama if output looks untranslated
     for attempt in range(2):
@@ -2538,11 +2623,12 @@ def _build_translation_section(page_texts: list[str], source_filename: str,
     ).replace("---PAGE BREAK---", "\n\n")
 
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
-    keep_lines = _is_deepl_output(assessment)   # see _build_text_translation_pdf
+    # Every line break in a scan's translation is kept: OCR text is one item
+    # per line, and re-flowing it runs lists together into dense paragraphs.
     for para in paragraphs:
         style = attestation_style if para.startswith(_NOTE_PREFIXES) else body_style
         markup = _xml(para)
-        if keep_lines and style is body_style:
+        if style is body_style:
             markup = "<br/>".join(l.strip() for l in markup.split("\n") if l.strip())
         story.append(Paragraph(markup, style))
 

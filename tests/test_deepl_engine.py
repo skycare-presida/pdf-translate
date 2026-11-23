@@ -65,7 +65,8 @@ def test_target_codes():
 
 def test_unwrap_joins_wrapped_prose_but_not_lists_or_headings():
     out = svc._unwrap_soft_breaks(SOURCE)
-    assert "Klinik aufgenommen und" in out and "auf die Normalstation verlegt." in out
+    assert "Klinik aufgenommen und nach" in out          # next line starts lower-case: joined...
+    assert "auf die\nNormalstation verlegt." in out     # ...a capital start is left alone (could be a list)
     assert "Medikation:\n- Ramipril 5 mg 1-0-0\n- Bisoprolol 2,5 mg 1-0-1" in out
     assert out.startswith("Entlassungsbericht\n\n")
     # two complete sentences on consecutive lines stay on separate lines
@@ -273,3 +274,31 @@ def test_whole_document_respects_switch_and_page_limit(monkeypatch):
     monkeypatch.setattr(svc, "DEEPL_DOCUMENT_TRANSLATION", False)
     svc.run_pipeline(_fitz_pdf(SOURCE), ".pdf", "English", "", "A", qa_mode="off")
     assert not getattr(svc.deepl_client, "doc_calls", [])
+
+
+def test_unwrap_never_merges_list_items():
+    """Lists without bullets, with odd OCR bullets, and long items all stay one per line."""
+    meds = ("TRATAMIENTO AL ALTA\n"
+            "Ramipril 5 mg un comprimido cada 24 horas por la mañana\n"
+            "Bisoprolol 2,5 mg un comprimido cada 12 horas con comida\n"
+            "Atorvastatina 40 mg un comprimido cada 24 horas por la noche\n"
+            "Acido acetilsalicilico 100 mg un comprimido cada 24 horas")
+    assert svc._unwrap_soft_breaks(meds) == meds
+    bullets = ("© Hipertension arterial en tratamiento desde el año 2015\n"
+               "© Diabetes mellitus tipo 2 con buen control metabolico\n"
+               "▪ Dislipemia en tratamiento con estatinas desde 2018")
+    assert svc._unwrap_soft_breaks(bullets) == bullets
+    wrapped = ("El paciente ingreso por dolor toracico agudo de dos horas de evolucion\n"
+               "y fue trasladado a la unidad coronaria, donde permanecio estable,\n"
+               "Sin complicaciones durante la estancia.")
+    out = svc._unwrap_soft_breaks(wrapped)
+    assert out.count("\n") == 0 and "evolucion y fue" in out and "estable, Sin" in out
+
+
+def test_scan_translation_keeps_one_item_per_line():
+    text = "Discharge medication\nRamipril 5 mg once daily\nBisoprolol 2.5 mg twice daily"
+    pdf = svc._build_translation_section([text], "doc.pdf", "English",
+                                         {"translation_model": svc.MODEL_MISTRAL, "language": "Spanish",
+                                          "confidence": 0.9})
+    page = svc.fitz.open(stream=pdf, filetype="pdf")[0].get_text()
+    assert "Ramipril 5 mg once daily\nBisoprolol 2.5 mg twice daily" in page
