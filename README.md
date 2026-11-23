@@ -147,6 +147,20 @@ budgeted at 6,000 output tokens per page, so a runaway page is caught in
 about a third of the time it used to take. The cover line names any pages
 read by local OCR.
 
+**Runaway OCR is abandoned as it happens.** The OCR response is streamed and
+checked every 1,500 characters. If the model starts looping on one line, or
+produces more text than the pages can hold, the call is dropped at once and
+the batch is split or the page is read locally — instead of waiting 2-5
+minutes for the model to reach its output cap. `OCR_STREAMING=off` in `.env`
+restores the single blocking call.
+
+**Lists stay lists.** The OCR prompt asks for every bullet, numbered item and
+table row on its own line. Before DeepL, wrapped lines are re-joined only
+when the next line plainly continues the sentence (starts lower-case, or
+follows a comma or hyphen), so list items — which start with a capital, a
+bullet or a number — are never merged. Scan translations are rendered line
+for line.
+
 **Cyrillic Tesseract fallback.** When Mistral over-produces on a scan it
 has identified as Cyrillic script, the service retries the OCR step
 locally with Tesseract (`ukr+rus+bul+srp+mkd+bel+kaz+eng`) before giving

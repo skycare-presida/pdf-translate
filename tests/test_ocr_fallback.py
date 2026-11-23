@@ -23,6 +23,34 @@ def _response(text, finish="stop"):
         finish_reason=finish, message=SimpleNamespace(content=text))])
 
 
+class _Stream:
+    """A streamed response: the stub's text delivered 200 characters at a time."""
+
+    def __init__(self, response):
+        self.response, self.closed, self.sent = response, False, 0
+
+    def __iter__(self):
+        choice = self.response.choices[0]
+        text = choice.message.content
+        for i in range(0, len(text), 200):
+            self.sent = i + 200
+            yield SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=text[i:i + 200]), finish_reason=None)])
+        yield SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=None), finish_reason=choice.finish_reason)])
+
+    def close(self):
+        self.closed = True
+
+
+_streams = []
+
+
+def _as_stream(response):
+    _streams.append(_Stream(response))
+    return _streams[-1]
+
+
 @pytest.fixture(autouse=True)
 def env(monkeypatch):
     monkeypatch.setattr(svc, "preprocess_image_bytes", lambda b, label="": b)
@@ -39,7 +67,8 @@ def _vision(monkeypatch, fn):
     def create(**kw):
         n_images = sum(1 for c in kw["messages"][0]["content"] if c["type"] == "image_url")
         calls.append((n_images, kw["max_tokens"]))
-        return fn(n_images)
+        response = fn(n_images)
+        return _as_stream(response) if kw.get("stream") else response
     monkeypatch.setattr(svc.ovh_client.chat.completions, "create", create)
     return calls
 
@@ -122,11 +151,63 @@ def test_local_ocr_overproduction_and_missing_tesseract_fail(monkeypatch):
         svc.ocr_images_with_assessment(["aGk="], "")
 
 
-def test_cyrillic_over_ceiling_still_uses_cyrillic_packs(monkeypatch):
+def test_cyrillic_hint_from_assessment_is_used_in_blocking_mode(monkeypatch):
     long = "слово " * 3000 + '\n```json\n{"language":"Ukrainian","script":"Cyrillic","confidence":0.8}\n```'
     _vision(monkeypatch, lambda n: _response(long))
+    monkeypatch.setattr(svc, "OCR_STREAMING", False)
     seen = []
     monkeypatch.setattr(svc, "ocr_with_tesseract",
                         lambda imgs, label="", script="": seen.append(script) or "Виписка з історії хвороби пацієнта лікарні")
     text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
     assert seen == ["cyrillic"] and assessment["language"] == "Ukrainian"
+
+
+def test_tesseract_language_choice(monkeypatch):
+    """Detected script picks the packs; no detection tries Latin and Cyrillic together."""
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(cmd)
+        if "--list-langs" in cmd:
+            return SimpleNamespace(stdout="List:\neng\nspa\nukr\nrus\nosd\n")
+        if "0" in cmd:                                   # --psm 0: script detection
+            return SimpleNamespace(stdout=fake_run.osd)
+        return SimpleNamespace(stdout="texto")
+    monkeypatch.setattr(svc.subprocess, "run", fake_run)
+
+    fake_run.osd = "Script: Cyrillic\nScript confidence: 4.1\n"
+    svc.ocr_with_tesseract(["aGk="], script="")
+    assert runs[-1][runs[-1].index("-l") + 1] == "ukr+eng"
+    fake_run.osd = ""                                    # detection gave nothing
+    svc.ocr_with_tesseract(["aGk="], script="")
+    assert runs[-1][runs[-1].index("-l") + 1] == "eng+spa+ukr"
+
+
+def test_looping_ocr_is_abandoned_early(monkeypatch):
+    """A loop is cut off within a few thousand characters, not at the cap."""
+    loop = "Paciente: nombre\n" + "0 0 0 0 0 0 0 0 0 0\n" * 4000        # 80k characters
+    _vision(monkeypatch, lambda n: _response(loop, finish="length"))
+    monkeypatch.setattr(svc, "ocr_with_tesseract", lambda imgs, label="", script="": PAGE)
+    _streams.clear()
+    text, assessment = svc.ocr_images_with_assessment(["aGk="], "", "page 1")
+    assert text == PAGE and assessment["ocr_engine"] == "tesseract"
+    assert _streams[0].closed and _streams[0].sent < 5000
+
+
+def test_rambling_ocr_is_abandoned_at_page_ceiling(monkeypatch):
+    ramble = "\n".join(f"linea distinta numero {i} del informe" for i in range(4000))
+    _vision(monkeypatch, lambda n: _response(ramble, finish="length"))
+    _streams.clear()
+    with pytest.raises(svc.TranslationTruncated):                       # two pages: caller splits
+        svc.ocr_images_with_assessment(["aGk=", "aGk="], "")
+    assert _streams[0].closed and _streams[0].sent < 2 * svc.MAX_OCR_CHARS_PER_PAGE + 3000
+
+
+def test_normal_page_streams_through_and_blocking_mode_still_works(monkeypatch):
+    ok = _response(PAGE + '\n```json\n{"language":"Spanish","confidence":0.9}\n```')
+    _vision(monkeypatch, lambda n: ok)
+    text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
+    assert text == PAGE and assessment["language"] == "Spanish"
+    monkeypatch.setattr(svc, "OCR_STREAMING", False)
+    text, assessment = svc.ocr_images_with_assessment(["aGk="], "")
+    assert text == PAGE and assessment["language"] == "Spanish"
